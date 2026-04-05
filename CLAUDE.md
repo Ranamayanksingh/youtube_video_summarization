@@ -9,10 +9,13 @@ A Python pipeline that downloads audio from YouTube videos, transcribes it to En
 ## Setup
 
 ```bash
-source venv/bin/activate
+bash setup.sh        # one-time: installs all system deps, creates .venv, verifies
+source .venv/bin/activate
 ```
 
-Dependencies already installed in `venv/`: `yt-dlp`, `mlx-whisper`, `ollama`. System requirements: FFmpeg (`/opt/homebrew/bin/ffmpeg`), Node.js (for yt-dlp JS challenges), Ollama running locally.
+`setup.sh` checks and installs: Homebrew, Python 3.12, uv, FFmpeg, Node.js, Ollama, llama3 model, Chrome (manual). Creates `.venv` via `uv` from `pyproject.toml`. Use `.venv/` going forward — the old `venv/` is superseded.
+
+System requirements (managed by setup.sh): FFmpeg, Node.js (yt-dlp JS challenges), Ollama running locally, Google Chrome (YouTube cookie extraction).
 
 ## Core Commands
 
