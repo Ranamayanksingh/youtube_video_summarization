@@ -36,8 +36,9 @@ def download_youtube_audio_as_wav(url: str, output_dir: str = "downloads"):
                 'Chrome/124.0.0.0 Safari/537.36'
             ),
         },
-        # Use android_vr client (tv_embedded is unsupported); enable remote EJS solver
-        'extractor_args': {'youtube': {'player_client': ['android_vr', 'web']}},
+        # web client supports cookies; use node (v25 available) for JS challenge solving
+        'extractor_args': {'youtube': {'player_client': ['web']}},
+        'js_runtimes': {'node': {}},
         'remote_components': {'ejs:github'},
     }
 
