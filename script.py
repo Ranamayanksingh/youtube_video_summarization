@@ -42,15 +42,34 @@ def download_youtube_audio_as_wav(url: str, output_dir: str = "downloads"):
     }
 
     try:
+        # Snapshot existing WAV files before download
+        before = set(
+            f for f in os.listdir(output_dir) if f.endswith(".wav")
+        ) if os.path.exists(output_dir) else set()
+
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             print(f"Downloading audio from: {url}")
-            info = ydl.extract_info(url, download=True)
+            ydl.extract_info(url, download=True)
 
-            title = info.get("title", "output")
-            filename = os.path.join(output_dir, f"{title}.wav")
+        # Find the newly created WAV file by diffing the directory
+        after = set(f for f in os.listdir(output_dir) if f.endswith(".wav"))
+        new_files = after - before
 
-            print(f"\n✅ Download complete: {filename}")
-            return filename
+        if not new_files:
+            # File already existed (same title); find by most recently modified
+            wav_files = [f for f in after]
+            if not wav_files:
+                print("❌ No WAV file found after download.")
+                return None
+            filename = os.path.join(
+                output_dir,
+                max(wav_files, key=lambda f: os.path.getmtime(os.path.join(output_dir, f)))
+            )
+        else:
+            filename = os.path.join(output_dir, new_files.pop())
+
+        print(f"\n✅ Download complete: {filename}")
+        return filename
 
     except Exception as e:
         print(f"❌ Error occurred: {e}")

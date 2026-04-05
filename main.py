@@ -102,13 +102,23 @@ Examples:
 
     # video mode
     video_parser = subparsers.add_parser("video", help="Summarize a specific YouTube video")
-    video_parser.add_argument("url", help="YouTube video URL")
+    video_parser.add_argument("url", help="YouTube video URL (quote URLs containing & or ?)")
+    video_parser.add_argument("extra", nargs="*", help=argparse.SUPPRESS)  # catch unquoted URL fragments
 
     # channel mode
     channel_parser = subparsers.add_parser("channel", help="Summarize the latest video from a channel")
     channel_parser.add_argument("url", help="YouTube channel URL (e.g. https://www.youtube.com/@ChannelName/videos)")
+    channel_parser.add_argument("extra", nargs="*", help=argparse.SUPPRESS)
 
     args = parser.parse_args()
+
+    if getattr(args, "extra", None):
+        print(
+            f"⚠️  Warning: extra arguments detected: {args.extra}\n"
+            "   This usually means the URL contains '&' and was not quoted.\n"
+            f"   Re-run with quotes: python main.py {args.mode} \"{args.url}&{'&'.join(args.extra)}\"\n"
+        )
+        sys.exit(1)
 
     if args.mode == "video":
         run_video_mode(args.url)
