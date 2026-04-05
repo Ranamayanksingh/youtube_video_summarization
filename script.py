@@ -36,9 +36,9 @@ def download_youtube_audio_as_wav(url: str, output_dir: str = "downloads"):
                 'Chrome/124.0.0.0 Safari/537.36'
             ),
         },
-        # Use Node.js for JS extraction (avoids missing-format warnings)
-        'extractor_args': {'youtube': {'player_client': ['tv_embedded']}},
-        'js_runtimes': {'node': {}},
+        # Use android_vr client (tv_embedded is unsupported); enable remote EJS solver
+        'extractor_args': {'youtube': {'player_client': ['android_vr', 'web']}},
+        'remote_components': {'ejs:github'},
     }
 
     try:
