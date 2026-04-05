@@ -1,0 +1,4 @@
+TELEGRAM_BOT_TOKEN=
+ALLOWED_TELEGRAM_USER_IDS=
+
+# rename this file as .env when you use this in your project

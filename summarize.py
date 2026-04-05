@@ -38,7 +38,7 @@ Transcript:
 """
 
 
-def summarize_file(txt_path: str, summaries_dir: str, model: str, overwrite: bool) -> str | None:
+def summarize_file(txt_path: str, summaries_dir: str, model: str, overwrite: bool, prompt_template: str | None = None) -> str | None:
     base_name = os.path.splitext(os.path.basename(txt_path))[0]
     summary_path = os.path.join(summaries_dir, base_name + ".summary.txt")
 
@@ -55,9 +55,10 @@ def summarize_file(txt_path: str, summaries_dir: str, model: str, overwrite: boo
 
     print(f"[SUMMARIZING] {base_name}")
 
+    template = prompt_template if prompt_template else PROMPT_TEMPLATE
     response = ollama.chat(
         model=model,
-        messages=[{"role": "user", "content": PROMPT_TEMPLATE.format(text=text)}],
+        messages=[{"role": "user", "content": template.format(text=text)}],
     )
     summary = response["message"]["content"].strip()
 
