@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+
+{% block title %}Processing — YT Summarizer{% endblock %}
+
+{% block content %}
+<div class="card">
+  <div class="processing-header">
+    <h2>Video Processing Queue</h2>
+    <span class="muted small">Auto-refreshes every 3 seconds</span>
+  </div>
+
+  <div
+    id="job-list"
+    hx-get="/api/job-rows"
+    hx-trigger="load, every 3s"
+    hx-swap="innerHTML"
+  >
+    {% if jobs %}
+      {% for job in jobs %}
+        {% include "partials/job_row.html" %}
+      {% endfor %}
+    {% else %}
+      <p class="muted">No jobs yet. <a href="/">Summarize a video</a> to get started.</p>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}

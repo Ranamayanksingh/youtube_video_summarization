@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+
+{% block title %}New Summary — YT Summarizer{% endblock %}
+
+{% block content %}
+<div class="card card-purple">
+  <h2>Summarize YouTube Videos</h2>
+  <p class="muted">Paste one or multiple YouTube links. For multiple videos, each processes in the background — you'll see progress on the <a href="/processing">Processing</a> page.</p>
+
+  {% if error %}
+    <p class="error">{{ error }}</p>
+  {% endif %}
+
+  <form method="post" action="/submit" class="submit-form">
+    <div class="mode-group">
+      <label class="radio-label">
+        <input type="radio" name="mode" value="video" checked />
+        🎬 Video(s)
+      </label>
+      <label class="radio-label">
+        <input type="radio" name="mode" value="channel" />
+        📺 Latest from channel
+      </label>
+    </div>
+
+    <div class="form-field" style="margin-bottom:.75rem">
+      <textarea
+        id="url"
+        name="url"
+        rows="4"
+        placeholder="Paste one or more YouTube URLs (one per line or space-separated)&#10;&#10;https://youtube.com/watch?v=abc123&#10;https://youtu.be/xyz456&#10;https://youtu.be/def789"
+        required
+        autofocus
+        style="width:100%;font-family:monospace;font-size:.9rem;resize:vertical"
+      ></textarea>
+      <span class="field-hint">One URL per line for batch processing. Batch jobs run in the background — you can leave and come back.</span>
+    </div>
+
+    <div class="form-row" style="align-items:flex-end">
+      <div class="form-field" style="flex:1">
+        <label for="collection">Add to collection <span class="field-hint">(optional)</span></label>
+        <select id="collection" name="collection">
+          <option value="">— No collection —</option>
+          {% for col in collections %}
+          {% set goal_emoji = {"exam_prep": "📝", "project_build": "🚀", "quiz_practice": "🎯"}.get(col.goal_type, "📚") %}
+          <option value="{{ col.name }}">{{ goal_emoji }} {{ col.name }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <button type="submit" class="btn-purple" style="margin-bottom:.1rem">Summarize →</button>
+    </div>
+  </form>
+</div>
+
+{% if summaries %}
+<div class="card">
+  <h3>Recent Summaries</h3>
+  <ul class="summary-list">
+    {% for s in summaries %}
+    <li><a href="/summaries/{{ s.slug }}">{{ s.title }}</a></li>
+    {% endfor %}
+  </ul>
+  <a href="/summaries" class="muted small">View all &rarr;</a>
+</div>
+{% endif %}
+{% endblock %}

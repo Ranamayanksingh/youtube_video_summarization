@@ -1,0 +1,21 @@
+{% if questions %}
+<div class="suggestions-wrap">
+  <p class="suggestions-label">Suggested questions</p>
+  <div class="suggestions-list">
+    {% for q in questions %}
+    <button class="suggestion-chip" onclick="useSuggestion(this)">{{ q }}</button>
+    {% endfor %}
+  </div>
+</div>
+<script>
+  function useSuggestion(chip) {
+    const input = document.querySelector('.qa-input-row input');
+    if (!input) return;
+    input.value = chip.textContent.trim();
+    // Hide suggestions after picking one
+    document.getElementById('suggestions-block').style.display = 'none';
+    // Trigger the HTMX-enhanced form
+    htmx.trigger(input.closest('form'), 'submit');
+  }
+</script>
+{% endif %}

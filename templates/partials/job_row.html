@@ -1,0 +1,51 @@
+<div class="job-row" id="job-row-{{ job.job_id }}">
+  <div class="job-row-info">
+    <div class="job-row-top">
+      <span class="job-status-badge status-{{ job.status }}">{{ job.status }}</span>
+      <span class="job-row-url">{{ job.url }}</span>
+    </div>
+
+    <div class="job-row-step">
+      {% if job.status in ("pending", "running") %}
+        <span class="pulse-dot"></span>
+      {% endif %}
+      <span class="job-row-step-text">
+        {%- set step = job.step or "" -%}
+        {%- if step.startswith("__done__") -%}
+          Done
+        {%- elif step.startswith("__error__") -%}
+          {{ step[9:] }}
+        {%- elif step -%}
+          {{ step }}
+        {%- else -%}
+          Waiting in queue…
+        {%- endif -%}
+      </span>
+    </div>
+
+    {% if job.status in ("pending", "running") %}
+    <div class="progress-track" style="margin-top:0.4rem">
+      <div class="progress-bar progress-bar-indeterminate"></div>
+    </div>
+    {% endif %}
+  </div>
+
+  <div class="job-row-actions">
+    {% if job.status in ("pending", "running") %}
+      <button
+        class="kill-btn"
+        hx-delete="/api/jobs/{{ job.job_id }}"
+        hx-target="#job-row-{{ job.job_id }}"
+        hx-swap="outerHTML"
+        hx-confirm="Kill this job?"
+        title="Kill job"
+      >&#x2715; Kill</button>
+    {% elif job.status == "done" %}
+      <a href="/summaries/{{ job.result_slug }}" class="view-btn">View &rarr;</a>
+    {% elif job.status == "cancelled" %}
+      <span class="muted small">Cancelled</span>
+    {% elif job.status == "error" %}
+      <span class="error small" title="{{ job.error }}">Failed</span>
+    {% endif %}
+  </div>
+</div>

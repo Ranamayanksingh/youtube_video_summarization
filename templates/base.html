@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>{% block title %}YT Summarizer{% endblock %}</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <script src="https://unpkg.com/htmx.org@1.9.12"></script>
+  <script src="https://unpkg.com/htmx.org@1.9.12/dist/ext/sse.js"></script>
+</head>
+<body>
+  <header>
+    <nav>
+      <a href="/" class="brand">YT Summarizer</a>
+      <div class="nav-links">
+        <a href="/about">About</a>
+        <a href="/">New</a>
+        <a href="/summaries">Past Summaries</a>
+        <a href="/processing">Processing</a>
+        <a href="/collections">Collections</a>
+        <a href="/subscriptions">Subscriptions</a>
+        <a href="/allowed-users">Bot Access</a>
+        <form method="post" action="/logout" style="display:inline">
+          <button type="submit" class="link-btn">Logout</button>
+        </form>
+      </div>
+    </nav>
+  </header>
+
+  <!-- Active jobs bar — polls every 3s, disappears when no jobs running -->
+  <div
+    id="active-jobs-wrap"
+    hx-get="/api/active-jobs"
+    hx-trigger="load, every 3s"
+    hx-swap="innerHTML"
+  ></div>
+
+  <main>
+    {% block content %}{% endblock %}
+  </main>
+
+  <footer>
+    <p>Running locally on your Mac &mdash; private by design.</p>
+  </footer>
+</body>
+</html>

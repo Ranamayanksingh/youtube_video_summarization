@@ -1,0 +1,12 @@
+{% if jobs %}
+<div class="active-jobs-bar">
+  <span class="pulse-dot"></span>
+  <span class="active-jobs-label">{{ jobs|length }} job{{ 's' if jobs|length != 1 }} running</span>
+  <div class="active-jobs-pills">
+    {% for job in jobs %}
+    <span class="active-job-pill">{{ job.step or "Starting…" }}</span>
+    {% endfor %}
+  </div>
+  <a href="/processing" class="active-jobs-link">View all &rarr;</a>
+</div>
+{% endif %}

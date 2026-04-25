@@ -1,0 +1,196 @@
+{% extends "base.html" %}
+
+{% block title %}About — YT Summarizer{% endblock %}
+
+{% block content %}
+
+<!-- Hero -->
+<div class="card about-hero">
+  <div class="about-hero-inner">
+    <div class="about-icon">▶</div>
+    <div>
+      <h1 class="about-title">YT Summarizer</h1>
+      <p class="about-subtitle">Turn any YouTube video into a clear, concise summary — in minutes, on your own machine.</p>
+    </div>
+  </div>
+  <button class="btn-primary tour-start-btn" onclick="startTour()">Take a tour →</button>
+</div>
+
+<!-- What it does -->
+<div class="card">
+  <h2>What does it do?</h2>
+  <p class="muted">Paste a YouTube link. The app does the rest — no manual work, no copying transcripts, no paying for a cloud API.</p>
+  <div class="feature-grid">
+    <div class="feature-item">
+      <span class="feature-icon">⬇️</span>
+      <div>
+        <strong>Download</strong>
+        <p class="muted">Fetches audio from any public YouTube video or the latest video from a channel.</p>
+      </div>
+    </div>
+    <div class="feature-item">
+      <span class="feature-icon">🎙️</span>
+      <div>
+        <strong>Transcribe</strong>
+        <p class="muted">Converts speech to text using Whisper large-v3. Works with Hindi and English audio — always outputs English.</p>
+      </div>
+    </div>
+    <div class="feature-item">
+      <span class="feature-icon">🧠</span>
+      <div>
+        <strong>Summarize</strong>
+        <p class="muted">Sends the transcript to a local LLM (llama3 via Ollama) and produces a structured summary.</p>
+      </div>
+    </div>
+    <div class="feature-item">
+      <span class="feature-icon">💬</span>
+      <div>
+        <strong>Ask questions</strong>
+        <p class="muted">After summarizing, ask anything about the video. The LLM answers using the transcript as context.</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Who can use it -->
+<div class="card">
+  <h2>Who can use it?</h2>
+  <p class="muted">Anyone who has been granted access. Here's how:</p>
+  <ol class="how-list" style="color: var(--text);">
+    <li><strong>Web UI</strong> — Log in with the access token and use it from any browser on any device.</li>
+    <li><strong>Telegram bot</strong> — Message the bot directly from Telegram. Send a YouTube link, get a summary. No browser needed.</li>
+    <li><strong>Morning briefings</strong> — Subscribe to a YouTube channel. Every day at your chosen time, the latest video is summarized and sent to you on Telegram automatically.</li>
+  </ol>
+</div>
+
+<!-- Privacy -->
+<div class="card">
+  <h2>Privacy first</h2>
+  <p class="muted">Everything runs locally on a single Mac. No data leaves the machine — audio, transcripts, and summaries are stored on disk, processed by local models. There is no external AI API call.</p>
+  <div class="privacy-pills">
+    <span class="privacy-pill">✓ No cloud AI</span>
+    <span class="privacy-pill">✓ No data sent externally</span>
+    <span class="privacy-pill">✓ Runs on Apple Silicon</span>
+    <span class="privacy-pill">✓ Open to your own users only</span>
+  </div>
+</div>
+
+<!-- Tour overlay -->
+<div id="tour-overlay" class="tour-overlay" style="display:none" onclick="closeTourOnBackdrop(event)">
+  <div class="tour-box" id="tour-box">
+    <div class="tour-step-label" id="tour-step-label">Step 1 of 5</div>
+    <div class="tour-icon" id="tour-icon"></div>
+    <h3 class="tour-title" id="tour-title"></h3>
+    <p class="tour-desc" id="tour-desc"></p>
+    <div class="tour-nav">
+      <button class="btn-ghost btn-sm" id="tour-prev" onclick="tourPrev()">← Back</button>
+      <div class="tour-dots" id="tour-dots"></div>
+      <button class="btn-primary btn-sm" id="tour-next" onclick="tourNext()">Next →</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const TOUR_STEPS = [
+  {
+    icon: "🏠",
+    title: "Start on the home page",
+    desc: "Click "New" in the nav or go to the home page. You'll see a form with two modes: Single Video and Latest from Channel.",
+    link: null,
+  },
+  {
+    icon: "🔗",
+    title: "Paste a YouTube URL",
+    desc: "Choose "Single video" and paste any YouTube video link, or choose "Latest from channel" and paste a channel URL to always get the newest video.",
+    link: "/",
+  },
+  {
+    icon: "⚙️",
+    title: "Watch the pipeline run",
+    desc: "The pipeline runs in three steps: Download → Transcribe → Summarize. You can watch live progress. Check the Processing page to see all active jobs.",
+    link: "/processing",
+  },
+  {
+    icon: "📄",
+    title: "Read your summary & ask questions",
+    desc: "Once done, you'll see the full summary. You can ask follow-up questions about the video right on the page — the LLM answers from the transcript.",
+    link: "/summaries",
+  },
+  {
+    icon: "📬",
+    title: "Set up a daily Telegram briefing",
+    desc: "Subscribe to any YouTube channel on the Subscriptions page. Every day at your chosen time (IST), you'll receive key highlights in Telegram — automatically.",
+    link: "/subscriptions",
+  },
+];
+
+let currentStep = 0;
+
+function startTour() {
+  currentStep = 0;
+  renderTourStep();
+  document.getElementById("tour-overlay").style.display = "flex";
+}
+
+function closeTour() {
+  document.getElementById("tour-overlay").style.display = "none";
+}
+
+function closeTourOnBackdrop(e) {
+  if (e.target === document.getElementById("tour-overlay")) closeTour();
+}
+
+function tourNext() {
+  if (currentStep < TOUR_STEPS.length - 1) {
+    currentStep++;
+    renderTourStep();
+  } else {
+    closeTour();
+  }
+}
+
+function tourPrev() {
+  if (currentStep > 0) {
+    currentStep--;
+    renderTourStep();
+  }
+}
+
+function renderTourStep() {
+  const step = TOUR_STEPS[currentStep];
+  const total = TOUR_STEPS.length;
+
+  document.getElementById("tour-step-label").textContent = `Step ${currentStep + 1} of ${total}`;
+  document.getElementById("tour-icon").textContent = step.icon;
+  document.getElementById("tour-title").textContent = step.title;
+  document.getElementById("tour-desc").textContent = step.desc;
+
+  const prevBtn = document.getElementById("tour-prev");
+  const nextBtn = document.getElementById("tour-next");
+  prevBtn.style.visibility = currentStep === 0 ? "hidden" : "visible";
+  nextBtn.textContent = currentStep === total - 1 ? "Finish ✓" : "Next →";
+
+  // Dots
+  const dotsEl = document.getElementById("tour-dots");
+  dotsEl.innerHTML = TOUR_STEPS.map((_, i) =>
+    `<span class="tour-dot ${i === currentStep ? 'tour-dot-active' : ''}"></span>`
+  ).join("");
+
+  // Navigate to the page the step references (after a short delay)
+  if (step.link) {
+    nextBtn.onclick = () => {
+      tourNext();
+    };
+  }
+}
+
+// Keyboard navigation
+document.addEventListener("keydown", (e) => {
+  if (document.getElementById("tour-overlay").style.display === "none") return;
+  if (e.key === "ArrowRight" || e.key === "Enter") tourNext();
+  if (e.key === "ArrowLeft") tourPrev();
+  if (e.key === "Escape") closeTour();
+});
+</script>
+
+{% endblock %}

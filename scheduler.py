@@ -25,9 +25,9 @@ SCHEDULE_MINUTE_UTC = 30
 def get_paths() -> tuple[str, str]:
     """Returns (python_executable, project_dir)."""
     project_dir = os.path.dirname(os.path.abspath(__file__))
-    venv_python = os.path.join(project_dir, "venv", "bin", "python")
+    venv_python = os.path.join(project_dir, ".venv", "bin", "python3")
     if not os.path.exists(venv_python):
-        sys.exit(f"❌ venv python not found at {venv_python}. Run: python -m venv venv && pip install -r requirements.txt")
+        sys.exit(f"❌ venv not found at {venv_python}. Run: bash setup.sh")
     return venv_python, project_dir
 
 

@@ -1,0 +1,70 @@
+{% extends "base.html" %}
+
+{% block title %}{{ title }} — YT Summarizer{% endblock %}
+
+{% block content %}
+<div class="card">
+  <div class="summary-header">
+    <h2>{{ title }}</h2>
+    <div class="summary-header-actions">
+      <a href="/summaries" class="muted small">&larr; All summaries</a>
+      <form
+        method="post"
+        action="/summaries/{{ slug }}/delete"
+        onsubmit="
+          if (!confirm('Delete this summary? Audio (.wav), transcript and summary files will all be removed.')) return false;
+          const btn = this.querySelector('button');
+          btn.disabled = true;
+          btn.textContent = '⏳ Deleting…';
+          return true;
+        "
+      >
+        <button type="submit" class="delete-btn-detail">🗑 Delete</button>
+      </form>
+    </div>
+  </div>
+  <article class="summary-body">{{ content }}</article>
+</div>
+
+{% if has_transcript %}
+<div class="card qa-card" id="qa-section">
+  <h3>Ask a Question</h3>
+
+  <!-- Suggested questions — loaded async on page load -->
+  <div
+    id="suggestions-block"
+    hx-get="/summaries/{{ slug }}/suggestions"
+    hx-trigger="load"
+    hx-swap="innerHTML"
+  >
+    <p class="suggestions-loading muted small">Loading suggestions…</p>
+  </div>
+
+  <!-- Chat history -->
+  <div class="qa-history" id="qa-answers">
+    <p class="muted small qa-empty">No questions yet. Ask something below.</p>
+  </div>
+
+  <div id="qa-spinner" class="htmx-indicator spinner">Thinking&hellip;</div>
+
+  <!-- Input pinned at bottom -->
+  <form
+    class="qa-input-row"
+    hx-post="/summaries/{{ slug }}/qa"
+    hx-target="#qa-answers"
+    hx-swap="beforeend"
+    hx-indicator="#qa-spinner"
+    hx-on::after-request="this.reset(); document.getElementById('qa-answers').scrollTop = 9999;"
+  >
+    <input
+      type="text"
+      name="question"
+      placeholder="What did they say about...?"
+      autocomplete="off"
+      required
+    />
+    <button type="submit">Ask</button>
+  </form>
+</div>
+{% endif %}
+{% endblock %}

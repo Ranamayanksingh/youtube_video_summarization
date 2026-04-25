@@ -1,0 +1,142 @@
+{% extends "base.html" %}
+
+{% block title %}{{ collection.name }} — Collections{% endblock %}
+
+{% block content %}
+{% set goal_emoji = {"exam_prep": "📝", "project_build": "🚀", "quiz_practice": "🎯"}.get(collection.goal_type, "📚") %}
+
+<div class="card card-orange">
+  <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:.5rem">
+    <div>
+      <h2>{{ goal_emoji }} {{ collection.name }}</h2>
+      <p class="muted">
+        {{ collection.goal_type | replace("_", " ") | title }}
+        {% if collection.description %} · {{ collection.description }}{% endif %}
+      </p>
+    </div>
+    <div style="display:flex;gap:.5rem;flex-wrap:wrap">
+      <a href="/collections/{{ collection.id }}/knowledge-file" class="btn-ghost btn-sm">⬇ Download .md</a>
+      <form method="post" action="/collections/{{ collection.id }}/rebuild" style="display:inline">
+        <button type="submit" class="btn-ghost btn-sm">♻️ Rebuild knowledge file</button>
+      </form>
+      <a href="/collections" class="btn-ghost btn-sm">← Back</a>
+    </div>
+  </div>
+
+  <div class="stats-row" style="margin-top:.75rem;display:flex;gap:1.5rem;flex-wrap:wrap">
+    <span>📹 <strong>{{ videos | length }}</strong> videos</span>
+    <span>📦 <strong>{{ total_items }}</strong> total items</span>
+    {% for t, c in type_counts.items() %}
+    <span>{{ c }} {{ t | replace("_", " ") }}{{ "s" if c != 1 else "" }}</span>
+    {% endfor %}
+  </div>
+</div>
+
+<!-- Q&A -->
+<div class="card">
+  <h3>🧠 Ask your knowledge base</h3>
+  <form hx-post="/collections/{{ collection.id }}/ask"
+        hx-target="#collection-answer"
+        hx-swap="innerHTML"
+        hx-indicator="#ask-spinner"
+        style="display:flex;gap:.5rem;flex-wrap:wrap">
+    <input type="text" name="question" placeholder="e.g. What is the formula for compound interest?" style="flex:1;min-width:200px" required />
+    <button type="submit" class="btn-primary">Ask</button>
+    <span id="ask-spinner" class="htmx-indicator muted">Thinking…</span>
+  </form>
+  {% if collection.goal_type == "project_build" %}
+  <form hx-post="/collections/{{ collection.id }}/suggest-projects"
+        hx-target="#collection-answer"
+        hx-swap="innerHTML"
+        hx-indicator="#proj-spinner"
+        style="margin-top:.5rem">
+    <button type="submit" class="btn-ghost btn-sm">💡 Suggest projects I can build</button>
+    <span id="proj-spinner" class="htmx-indicator muted">Generating…</span>
+  </form>
+  {% endif %}
+  <div id="collection-answer" style="margin-top:1rem"></div>
+</div>
+
+<!-- Tabs -->
+<div class="card" style="padding-bottom:0">
+  <nav class="tab-nav" style="display:flex;gap:.25rem;flex-wrap:wrap;border-bottom:1px solid var(--border);margin-bottom:1rem">
+    {% set tabs = [("all","All"),("question","Questions"),("formula","Formulas"),("trick","Tricks"),("concept","Concepts"),("tool","Tools"),("code_pattern","Code"),("project_idea","Ideas")] %}
+    {% for t_id, t_label in tabs %}
+    {% set count = type_counts.get(t_id, total_items if t_id == "all" else 0) %}
+    {% if count > 0 or t_id == "all" %}
+    <a href="/collections/{{ collection.id }}?tab={{ t_id }}"
+       class="tab-link{% if tab == t_id %} tab-active{% endif %}"
+       style="padding:.4rem .75rem;text-decoration:none;border-radius:4px 4px 0 0;font-size:.9rem">
+      {{ t_label }}{% if count %} <span class="badge">{{ count }}</span>{% endif %}
+    </a>
+    {% endif %}
+    {% endfor %}
+  </nav>
+
+  {% if items %}
+  <ul class="knowledge-list" style="list-style:none;padding:0;margin:0 0 1rem">
+    {% for item in items %}
+    <li class="knowledge-item" style="padding:.75rem 0;border-bottom:1px solid var(--border)">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:.5rem">
+        <div style="flex:1">
+          {% if item.topic %}
+          <span class="badge" style="margin-bottom:.25rem">{{ item.topic }}</span>
+          {% endif %}
+          <div style="white-space:pre-wrap;line-height:1.6">{{ item.content }}</div>
+          {% if item.answer %}
+          <div style="margin-top:.35rem;color:var(--muted);font-size:.9rem">
+            <strong>Answer:</strong> {{ item.answer }}
+          </div>
+          {% endif %}
+          {% if item.video_title %}
+          <div style="margin-top:.25rem;font-size:.8rem;color:var(--muted)">
+            Source: {{ item.video_title }}
+          </div>
+          {% endif %}
+        </div>
+        <span class="badge" style="flex-shrink:0;font-size:.75rem">{{ item.item_type | replace("_"," ") }}</span>
+      </div>
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p class="muted" style="padding-bottom:1rem">
+    No {{ tab | replace("_", " ") }} items yet.
+    {% if videos | length == 0 %}
+      Add videos to this collection via the Telegram bot to start building your knowledge base.
+    {% else %}
+      These items may not have been extracted yet — try ♻️ Rebuild above.
+    {% endif %}
+  </p>
+  {% endif %}
+</div>
+
+<!-- Videos list -->
+{% if videos %}
+<div class="card">
+  <h3>📹 Videos in this collection</h3>
+  <ul class="sub-list">
+    {% for v in videos %}
+    <li class="sub-item">
+      <div class="sub-info">
+        {% if v.video_url %}
+        <a href="{{ v.video_url }}" target="_blank" class="sub-channel">{{ v.title or v.video_url }}</a>
+        {% else %}
+        <span class="sub-channel">{{ v.title or "Untitled" }}</span>
+        {% endif %}
+        <span class="sub-meta">
+          Added {{ v.created_at.strftime("%d %b %Y") if v.created_at else "" }}
+          &nbsp;·&nbsp;
+          {% if v.extraction_done %}
+          <span style="color:var(--green)">✅ Extracted</span>
+          {% else %}
+          <span style="color:var(--muted)">⏳ Pending extraction</span>
+          {% endif %}
+        </span>
+      </div>
+    </li>
+    {% endfor %}
+  </ul>
+</div>
+{% endif %}
+{% endblock %}

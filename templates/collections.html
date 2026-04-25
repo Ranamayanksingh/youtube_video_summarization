@@ -1,0 +1,112 @@
+{% extends "base.html" %}
+
+{% block title %}Collections — YT Summarizer{% endblock %}
+
+{% block content %}
+<div class="card card-orange">
+  <h2>📚 Knowledge Collections</h2>
+  <p class="muted">
+    Collections extract structured knowledge (formulas, questions, tricks, concepts) from your videos
+    and compile them into a growing knowledge base you can quiz from or ask questions against.
+  </p>
+
+  {% if error %}
+  <p class="error">{{ error }}</p>
+  {% endif %}
+
+  <form method="post" action="/collections/create" class="sub-form">
+    <div class="form-row">
+      <div class="form-field">
+        <label for="name">Collection Name</label>
+        <input type="text" id="name" name="name" placeholder="e.g. SSC CGL Maths" required autocomplete="off" />
+      </div>
+      <div class="form-field">
+        <label for="goal_type">Goal Type</label>
+        <select id="goal_type" name="goal_type">
+          <option value="exam_prep">📝 Exam Prep</option>
+          <option value="quiz_practice">🎯 Quiz Practice</option>
+          <option value="project_build">🚀 Project Build</option>
+        </select>
+      </div>
+    </div>
+    <div class="form-field">
+      <label for="description">Description</label>
+      <input type="text" id="description" name="description" placeholder="What this collection is for…" />
+    </div>
+    <div class="form-field">
+      <label for="extract_focus">Extract Focus <span class="field-hint">(comma-separated)</span></label>
+      <input type="text" id="extract_focus" name="extract_focus" value="formulas,questions,tricks,concepts" />
+    </div>
+    <button type="submit" class="btn-primary btn-green">Create Collection</button>
+  </form>
+
+  {% if presets %}
+  <details style="margin-top:1rem">
+    <summary class="muted" style="cursor:pointer">Or load a preset…</summary>
+    <div class="preset-grid" style="margin-top:.75rem;display:flex;flex-wrap:wrap;gap:.5rem">
+      {% for p in presets %}
+      <form method="post" action="/collections/create">
+        <input type="hidden" name="name" value="{{ p.name }}" />
+        <input type="hidden" name="goal_type" value="{{ p.goal_type }}" />
+        <input type="hidden" name="description" value="{{ p.description }}" />
+        <input type="hidden" name="extract_focus" value="{{ p.extract_focus | join(',') }}" />
+        <button type="submit" class="btn-ghost btn-sm">+ {{ p.name }}</button>
+      </form>
+      {% endfor %}
+    </div>
+  </details>
+  {% endif %}
+</div>
+
+{% if collections %}
+<div class="card">
+  <h3>Your Collections</h3>
+  <ul class="sub-list">
+    {% for col in collections %}
+    {% set goal_emoji = {"exam_prep": "📝", "project_build": "🚀", "quiz_practice": "🎯"}.get(col.goal_type, "📚") %}
+    <li class="sub-item">
+      <div class="sub-info">
+        <a href="/collections/{{ col.id }}" class="sub-channel">{{ goal_emoji }} {{ col.name }}</a>
+        <span class="sub-meta">
+          {{ col.goal_type | replace("_", " ") | title }}
+          &nbsp;·&nbsp;
+          <strong>{{ col.video_count }}</strong> video{{ "s" if col.video_count != 1 else "" }}
+          &nbsp;·&nbsp;
+          <strong>{{ col.item_count }}</strong> items
+          {% if col.description %}
+          &nbsp;·&nbsp; <em>{{ col.description[:80] }}{% if col.description|length > 80 %}…{% endif %}</em>
+          {% endif %}
+        </span>
+      </div>
+      <div class="sub-actions">
+        <a href="/collections/{{ col.id }}" class="btn-ghost btn-sm">View</a>
+        <a href="/collections/{{ col.id }}/knowledge-file" class="btn-ghost btn-sm">⬇ .md</a>
+        <form method="post" action="/collections/{{ col.id }}/rebuild" style="display:inline">
+          <button type="submit" class="btn-ghost btn-sm">♻️ Rebuild</button>
+        </form>
+        <form method="post" action="/collections/{{ col.id }}/delete" style="display:inline"
+              onsubmit="return confirm('Delete collection {{ col.name }} and all its knowledge items?')">
+          <button type="submit" class="btn-ghost btn-sm btn-danger">Delete</button>
+        </form>
+      </div>
+    </li>
+    {% endfor %}
+  </ul>
+</div>
+{% else %}
+<div class="card">
+  <p class="muted">No collections yet. Create one above, then add videos to it via the Telegram bot or CLI.</p>
+</div>
+{% endif %}
+
+<div class="card">
+  <h3>How collections work</h3>
+  <ol class="how-list">
+    <li>Create a collection above and choose its goal type (<em>Exam Prep</em>, <em>Quiz Practice</em>, or <em>Project Build</em>).</li>
+    <li>Send YouTube video links via the Telegram bot. After each summary, the bot asks you which collection to add it to.</li>
+    <li>The system extracts formulas, questions, tricks, and concepts from each video transcript using AI.</li>
+    <li>All extracted items are compiled into a growing <code>knowledge/CollectionName.md</code> file you can download and use anywhere.</li>
+    <li>Use <code>/quiz</code> in the bot to get random questions, or <code>/ask</code> to query your entire knowledge base.</li>
+  </ol>
+</div>
+{% endblock %}

@@ -1,0 +1,122 @@
+{% extends "base.html" %}
+
+{% block title %}Processing — YT Summarizer{% endblock %}
+
+{% block content %}
+<div class="card">
+  <div class="job-header">
+    <h2>Processing&hellip;</h2>
+    <span class="badge badge-running">Running</span>
+  </div>
+  <p class="muted small">{{ job.url }}</p>
+
+  <!-- Progress bar -->
+  <div class="progress-track">
+    <div class="progress-bar" id="progress-bar"></div>
+  </div>
+  <p class="progress-label muted small" id="progress-label">Starting&hellip;</p>
+
+  <!-- Step indicators -->
+  <div class="steps">
+    <div class="step" id="step-0">
+      <div class="step-dot"></div>
+      <span>Download</span>
+    </div>
+    <div class="step-line"></div>
+    <div class="step" id="step-1">
+      <div class="step-dot"></div>
+      <span>Transcribe</span>
+    </div>
+    <div class="step-line"></div>
+    <div class="step" id="step-2">
+      <div class="step-dot"></div>
+      <span>Summarize</span>
+    </div>
+  </div>
+
+  <!-- Log -->
+  <div
+    id="progress-wrap"
+    hx-ext="sse"
+    sse-connect="/jobs/{{ job.job_id }}/stream"
+    sse-swap="message"
+    hx-swap="beforeend"
+  >
+    <div id="log" class="log-box"></div>
+  </div>
+
+  <div id="done-banner" style="display:none" class="done-banner">
+    <span>Done!</span>
+    <a id="summary-link" href="#">View Summary &rarr;</a>
+  </div>
+
+  <div id="error-banner" style="display:none" class="error-banner">
+    <span id="error-msg"></span>
+    <a href="/">Try again</a>
+  </div>
+</div>
+
+<script>
+  const log = document.getElementById("log");
+  const wrap = document.getElementById("progress-wrap");
+  const progressBar = document.getElementById("progress-bar");
+  const progressLabel = document.getElementById("progress-label");
+
+  // Map log message keywords → step index (0,1,2) and % width
+  const STEP_MAP = [
+    { keywords: ["download", "fetching latest"],  step: 0, pct: 15 },
+    { keywords: ["transcrib"],                     step: 1, pct: 50 },
+    { keywords: ["summariz"],                      step: 2, pct: 80 },
+  ];
+
+  function activateStep(idx) {
+    for (let i = 0; i <= idx; i++) {
+      const el = document.getElementById("step-" + i);
+      if (el) el.classList.add(i < idx ? "step-done" : "step-active");
+    }
+  }
+
+  function updateProgress(msg) {
+    const lower = msg.toLowerCase();
+    for (const { keywords, step, pct } of STEP_MAP) {
+      if (keywords.some(k => lower.includes(k))) {
+        progressBar.style.width = pct + "%";
+        progressLabel.textContent = msg;
+        activateStep(step);
+        return;
+      }
+    }
+    progressLabel.textContent = msg;
+  }
+
+  wrap.addEventListener("htmx:sseMessage", function (e) {
+    const line = document.createElement("div");
+    line.textContent = e.detail.data;
+    log.appendChild(line);
+    log.scrollTop = log.scrollHeight;
+    updateProgress(e.detail.data);
+  });
+
+  wrap.addEventListener("htmx:sseBeforeMessage", function (e) {
+    if (e.detail.type === "done") {
+      e.preventDefault();
+      progressBar.style.width = "100%";
+      progressBar.classList.add("progress-done");
+      progressLabel.textContent = "Complete!";
+      activateStep(3);
+      document.querySelectorAll(".step").forEach(s => s.classList.add("step-done"));
+      document.getElementById("done-banner").style.display = "flex";
+      const slug = e.detail.data;
+      document.getElementById("summary-link").href = "/summaries/" + slug;
+      setTimeout(() => { window.location.href = "/summaries/" + slug; }, 2000);
+    }
+    if (e.detail.type === "error") {
+      e.preventDefault();
+      progressBar.classList.add("progress-error");
+      progressLabel.textContent = "Failed.";
+      document.getElementById("error-banner").style.display = "flex";
+      document.getElementById("error-msg").textContent = e.detail.data;
+    }
+  });
+</script>
+{% endblock %}

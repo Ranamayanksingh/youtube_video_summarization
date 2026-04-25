@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+
+{% block title %}Past Summaries — YT Summarizer{% endblock %}
+
+{% block content %}
+<div class="card">
+  <h2>Past Summaries</h2>
+
+  {% if summaries %}
+    <ul class="summary-list" id="summary-list">
+      {% for s in summaries %}
+      <li id="summary-{{ s.slug }}">
+        <a href="/summaries/{{ s.slug }}">{{ s.title }}</a>
+        <button
+          class="delete-btn"
+          hx-delete="/summaries/{{ s.slug }}"
+          hx-confirm="Delete '{{ s.title }}'? Audio, transcript and summary will all be removed."
+          hx-target="#summary-{{ s.slug }}"
+          hx-swap="outerHTML swap:300ms"
+          hx-indicator="this"
+          title="Delete"
+        >
+          <span class="delete-btn-label">
+            <svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="3 6 5 6 21 6"></polyline>
+              <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"></path>
+              <path d="M10 11v6"></path>
+              <path d="M14 11v6"></path>
+              <path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"></path>
+            </svg>
+          </span>
+          <span class="delete-btn-loading" style="display:none">&#x23F3;</span>
+        </button>
+      </li>
+      {% endfor %}
+    </ul>
+  {% else %}
+    <p class="muted">No summaries yet. <a href="/">Summarize a video</a> to get started.</p>
+  {% endif %}
+</div>
+
+<script>
+  // Show spinner on the button while htmx request is in-flight
+  document.addEventListener("htmx:beforeRequest", function(e) {
+    const btn = e.detail.elt;
+    if (!btn.classList.contains("delete-btn")) return;
+    btn.disabled = true;
+    btn.querySelector(".delete-btn-label").style.display = "none";
+    btn.querySelector(".delete-btn-loading").style.display = "inline";
+  });
+</script>
+{% endblock %}

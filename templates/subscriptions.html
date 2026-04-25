@@ -1,0 +1,124 @@
+{% extends "base.html" %}
+
+{% block title %}Subscriptions — YT Summarizer{% endblock %}
+
+{% block content %}
+<div class="card card-orange">
+  <h2>☀️ Morning Briefings</h2>
+  <p class="muted">
+    Subscribe to a YouTube channel. Every day at your chosen time (IST), the
+    latest video is summarised and the key highlights are sent to you on Telegram —
+    like a morning newspaper.
+  </p>
+
+  {% if not bot_configured %}
+  <div class="alert alert-warn">
+    <strong>TELEGRAM_BOT_TOKEN</strong> is not set in your <code>.env</code> file.
+    Subscriptions won't send until the bot token is configured.
+  </div>
+  {% endif %}
+
+  {% if error %}
+  <p class="error">{{ error }}</p>
+  {% endif %}
+
+  {% if success %}
+  <p class="success-msg">{{ success }}</p>
+  {% endif %}
+
+  <form method="post" action="/subscriptions/add" class="sub-form">
+    <div class="form-row">
+      <div class="form-field">
+        <label for="telegram_chat_id">Telegram Chat ID</label>
+        <input
+          type="text"
+          id="telegram_chat_id"
+          name="telegram_chat_id"
+          placeholder="e.g. 123456789"
+          required
+          autocomplete="off"
+        />
+        <span class="field-hint">Find yours by messaging <a href="https://t.me/userinfobot" target="_blank">@userinfobot</a></span>
+      </div>
+      <div class="form-field">
+        <label for="run_time">Daily time (IST)</label>
+        <input
+          type="time"
+          id="run_time"
+          name="run_time"
+          value="07:00"
+          required
+        />
+      </div>
+    </div>
+
+    <div class="form-field">
+      <label for="channel_url">YouTube Channel URL</label>
+      <input
+        type="url"
+        id="channel_url"
+        name="channel_url"
+        placeholder="https://youtube.com/@ChannelName"
+        required
+      />
+    </div>
+
+    <button type="submit" class="btn-primary btn-green">Add Subscription</button>
+  </form>
+</div>
+
+{% if subs %}
+<div class="card">
+  <h3>Active Subscriptions</h3>
+  <ul class="sub-list">
+    {% for sub in subs %}
+    <li class="sub-item">
+      <div class="sub-info">
+        <span class="sub-channel">{{ sub.channel_url }}</span>
+        <span class="sub-meta">
+          Chat ID: <code>{{ sub.telegram_chat_id }}</code>
+          &nbsp;·&nbsp;
+          Daily at <strong>{{ sub.run_time }} IST</strong>
+          {% if sub.enabled is defined and not sub.enabled %}<span class="badge badge-off">paused</span>{% endif %}
+        </span>
+      </div>
+      <div class="sub-actions">
+        <!-- Test button -->
+        <form method="post" action="/subscriptions/test" style="display:inline">
+          <input type="hidden" name="telegram_chat_id" value="{{ sub.telegram_chat_id }}" />
+          <input type="hidden" name="channel_url" value="{{ sub.channel_url }}" />
+          <button type="submit" class="btn-ghost btn-sm">Send test</button>
+        </form>
+        <!-- Delete button -->
+        <form
+          method="post"
+          action="/subscriptions/delete"
+          style="display:inline"
+          onsubmit="return confirm('Remove this subscription?')"
+        >
+          <input type="hidden" name="telegram_chat_id" value="{{ sub.telegram_chat_id }}" />
+          <input type="hidden" name="channel_url" value="{{ sub.channel_url }}" />
+          <button type="submit" class="btn-ghost btn-sm btn-danger">Remove</button>
+        </form>
+      </div>
+    </li>
+    {% endfor %}
+  </ul>
+</div>
+{% else %}
+<div class="card">
+  <p class="muted">No subscriptions yet. Add one above to start receiving morning briefings.</p>
+</div>
+{% endif %}
+
+<div class="card">
+  <h3>How it works</h3>
+  <ol class="how-list">
+    <li>Message <a href="https://t.me/userinfobot" target="_blank">@userinfobot</a> on Telegram to get your Chat ID.</li>
+    <li>Make sure you've started a conversation with your bot (<code>TELEGRAM_BOT_TOKEN</code> in <code>.env</code>).</li>
+    <li>Add a subscription above with a YouTube channel and your preferred daily time.</li>
+    <li>Every day at that time, the latest video from the channel is downloaded, transcribed, and summarised. The 5 key highlights arrive in your Telegram — before you even make coffee.</li>
+    <li>Click <em>Send test</em> to verify the connection right now.</li>
+  </ol>
+</div>
+{% endblock %}

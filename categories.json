@@ -1,0 +1,52 @@
+{
+  "collections": [
+    {
+      "name": "SSC CGL Maths",
+      "goal_type": "exam_prep",
+      "description": "SSC CGL mathematics preparation — percentages, profit & loss, time & work, speed, geometry, algebra, trigonometry",
+      "extract_focus": ["formulas", "questions", "tricks", "concepts"]
+    },
+    {
+      "name": "SSC CGL Reasoning",
+      "goal_type": "exam_prep",
+      "description": "SSC CGL reasoning preparation — series, analogy, coding-decoding, blood relations, direction sense, puzzles",
+      "extract_focus": ["questions", "tricks", "concepts"]
+    },
+    {
+      "name": "SSC CGL English",
+      "goal_type": "exam_prep",
+      "description": "SSC CGL English preparation — grammar, vocabulary, reading comprehension, fill in the blanks, error spotting",
+      "extract_focus": ["questions", "concepts", "tricks"]
+    },
+    {
+      "name": "AI & LLM Learning",
+      "goal_type": "project_build",
+      "description": "Learning about AI, large language models, RAG, fine-tuning, prompt engineering, LangChain, embeddings, transformers",
+      "extract_focus": ["concepts", "tools", "code_patterns", "project_ideas"]
+    },
+    {
+      "name": "Ayurveda BAMS",
+      "goal_type": "quiz_practice",
+      "description": "BAMS competitive exam preparation — Ayurvedic medicine, anatomy, physiology, Tridosha, herbs, classical texts, MCQs",
+      "extract_focus": ["questions", "concepts", "formulas"]
+    }
+  ],
+
+  "goal_types": {
+    "exam_prep": {
+      "description": "Competitive exam preparation — extracts formulas, MCQ questions, shortcuts and topic concepts",
+      "extract_focus": ["formulas", "questions", "tricks", "concepts"],
+      "delivery": "Quiz on demand or scheduled, Q&A from knowledge base"
+    },
+    "project_build": {
+      "description": "Learning a skill to build something — extracts concepts, tools, code patterns, project ideas",
+      "extract_focus": ["concepts", "tools", "code_patterns", "project_ideas"],
+      "delivery": "Project plan generation, concept explanations, tool comparisons"
+    },
+    "quiz_practice": {
+      "description": "Regular practice drilling — heavy focus on MCQ extraction and scheduled quizzing",
+      "extract_focus": ["questions", "concepts", "formulas"],
+      "delivery": "Scheduled quiz delivery (e.g. every hour), answer reveal, score tracking"
+    }
+  }
+}
