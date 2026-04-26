@@ -268,14 +268,19 @@ def _msg(context: ContextTypes.DEFAULT_TYPE, key: str, **kwargs) -> str:
 
 def _is_youtube_url(text: str) -> bool:
     text = text.strip()
-    return "youtube.com/watch" in text or "youtu.be/" in text
+    return (
+        "youtube.com/watch" in text
+        or "youtu.be/" in text
+        or "youtube.com/live/" in text
+        or "youtube.com/shorts/" in text
+    )
 
 
 def _extract_youtube_urls(text: str) -> list[str]:
     """Extract all YouTube URLs from a block of text (newline or space separated)."""
     import re
-    # Match full URLs including query strings
-    pattern = r'https?://(?:www\.)?(?:youtube\.com/watch\S+|youtu\.be/\S+)'
+    # Match full URLs including query strings — covers /watch, /live, /shorts, youtu.be
+    pattern = r'https?://(?:www\.)?(?:youtube\.com/(?:watch|live|shorts)\S+|youtu\.be/\S+)'
     found = re.findall(pattern, text)
     # Deduplicate while preserving order
     seen = set()
@@ -304,7 +309,7 @@ async def _transcribe_with_keepalive(
       thread is abandoned (mlx-whisper cannot be cancelled mid-run) and None
       is returned so the pipeline reports failure gracefully.
     """
-    from transcribe import TRANSCRIBE_TIMEOUT_SECS
+    from app.pipeline.transcriber import TRANSCRIBE_TIMEOUT_SECS
 
     keepalive_interval_secs = 4
     ping_interval_secs = 120  # text message every 2 minutes
