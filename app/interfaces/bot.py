@@ -45,6 +45,9 @@ from telegram.ext import (
 from app.db import (
     add_video_history, get_user_history, delete_user_history, ensure_history_table,
     get_collections, get_collection_by_name, ensure_collections_tables,
+    add_subscription, remove_subscription, load_subscriptions,
+    ensure_pipeline_jobs_table, create_job, advance_job,
+    increment_retry, get_stuck_jobs, get_all_stuck_jobs,
 )
 from app.pipeline.downloader import download_youtube_audio_as_wav
 from app.pipeline.transcriber import transcribe_file, DEFAULT_WHISPER_MODEL
@@ -53,6 +56,9 @@ from app.pipeline.extractor import extract_and_store
 from app.knowledge.builder import build_knowledge_file
 from app.knowledge.qa import answer_question as collection_answer_question
 from app.knowledge.quiz import send_quiz
+from app.utils.youtube import get_latest_video
+from app.utils.notifications import extract_highlights, send_telegram_message
+from app.db import update_subscription_last_sent, ensure_subscriptions_table
 
 load_dotenv()
 
@@ -976,62 +982,124 @@ async def receive_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(_msg(context, "starting"))
 
     async def _run_pipeline():
+        # Max retries per step
+        MAX_RETRIES = {"downloading": 3, "transcribing": 2, "summarizing": 2, "sending": 3}
+
+        # Create a job record so we can track and resume on failure
+        job_id = await asyncio.to_thread(
+            create_job, user_id, update.effective_chat.id, url
+        )
+        logger.info("Pipeline job %d created for user %d url=%s", job_id, user_id, url)
+
+        async def _retry(step: str, fn, *args, **kwargs):
+            """Run fn(*args) with up to MAX_RETRIES[step] attempts. Returns result or None."""
+            retries = MAX_RETRIES.get(step, 2)
+            for attempt in range(1, retries + 1):
+                try:
+                    result = await fn(*args, **kwargs)
+                    if result:
+                        return result
+                    raise ValueError("empty result")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    await asyncio.to_thread(increment_retry, job_id)
+                    if attempt < retries:
+                        logger.warning(
+                            "Job %d step=%s attempt %d/%d failed: %s — retrying…",
+                            job_id, step, attempt, retries, e,
+                        )
+                        await asyncio.sleep(2 ** attempt)  # 2s, 4s, 8s back-off
+                    else:
+                        logger.error(
+                            "Job %d step=%s failed after %d attempts: %s",
+                            job_id, step, retries, e,
+                        )
+                        await asyncio.to_thread(
+                            advance_job, job_id, "failed", error_msg=str(e)
+                        )
+                        return None
+
         try:
             async with PIPELINE_SEMAPHORE:
-                # Step 1: Download
+                # ── Step 1: Download ──────────────────────────────────────────
+                await asyncio.to_thread(advance_job, job_id, "downloading")
                 await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
                 await update.message.reply_text(_msg(context, "step1"))
-                wav_path = await asyncio.to_thread(
-                    download_youtube_audio_as_wav, url, DOWNLOADS_DIR
+
+                wav_path = await _retry(
+                    "downloading",
+                    asyncio.to_thread, download_youtube_audio_as_wav, url, DOWNLOADS_DIR,
                 )
                 if not wav_path:
                     await update.message.reply_text(_msg(context, "dl_fail"))
                     return
+                await asyncio.to_thread(advance_job, job_id, "transcribing", wav_path=wav_path)
 
-                # Step 2: Transcribe (with periodic keepalive so Telegram shows typing)
+                # ── Step 2: Transcribe ────────────────────────────────────────
                 await update.message.reply_text(_msg(context, "step2"))
-                txt_path = await _transcribe_with_keepalive(
-                    wav_path,
-                    update.effective_chat.id,
-                    context.bot,
-                    lang=lang,
-                )
+
+                async def _do_transcribe():
+                    return await _transcribe_with_keepalive(
+                        wav_path, update.effective_chat.id, context.bot, lang=lang,
+                    )
+
+                txt_path = await _retry("transcribing", _do_transcribe)
                 if not txt_path:
                     await update.message.reply_text(_msg(context, "tx_fail"))
                     return
 
-                # Step 3: Summarize
+                title = os.path.splitext(os.path.basename(txt_path))[0]
+                await asyncio.to_thread(
+                    advance_job, job_id, "summarizing", title=title, txt_path=txt_path,
+                )
+
+                # ── Step 3: Summarize ─────────────────────────────────────────
                 await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
                 await update.message.reply_text(_msg(context, "step3"))
-                summary_path = await asyncio.to_thread(
-                    summarize_file,
-                    txt_path,
-                    SUMMARIES_DIR,
-                    DEFAULT_LLM_MODEL,
-                    True,
-                    custom_prompt,
-                    lang,
+
+                summary_path = await _retry(
+                    "summarizing",
+                    asyncio.to_thread,
+                    summarize_file, txt_path, SUMMARIES_DIR,
+                    DEFAULT_LLM_MODEL, True, custom_prompt, lang,
                 )
                 if not summary_path:
                     await update.message.reply_text(_msg(context, "sum_fail"))
                     return
+                await asyncio.to_thread(
+                    advance_job, job_id, "sending", summary_path=summary_path,
+                )
 
+                # ── Step 4: Send ──────────────────────────────────────────────
                 with open(txt_path, "r", encoding="utf-8") as f:
                     context.user_data["transcript"] = f.read().strip()
-
                 with open(summary_path, "r", encoding="utf-8") as f:
                     summary = f.read().strip()
 
-                # Store paths for collection assignment
-                title = os.path.splitext(os.path.basename(txt_path))[0]
                 context.user_data["transcript_path"] = txt_path
                 context.user_data["summary_path"] = summary_path
                 context.user_data["video_url"] = url
                 context.user_data["video_title"] = title
 
-                await update.message.reply_text(_msg(context, "done"))
-                for chunk in _split_message(summary):
-                    await update.message.reply_text(chunk)
+                async def _do_send():
+                    await update.message.reply_text(_msg(context, "done"))
+                    for chunk in _split_message(summary):
+                        await update.message.reply_text(chunk)
+                    return True  # signal success to _retry
+
+                sent = await _retry("sending", _do_send)
+                if not sent:
+                    # Summary exists but Telegram delivery failed — job stays at 'sending'
+                    # so /retry can resend without re-processing
+                    logger.error(
+                        "Job %d: summary ready but Telegram send failed after retries", job_id
+                    )
+                    return
+
+                # ── Done ──────────────────────────────────────────────────────
+                await asyncio.to_thread(advance_job, job_id, "done")
+                logger.info("Pipeline job %d done for user %d", job_id, user_id)
 
                 # Save to history
                 try:
@@ -1059,9 +1127,11 @@ async def receive_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     )
 
         except asyncio.CancelledError:
-            logger.info("Pipeline cancelled for user %s", user_id)
+            logger.info("Pipeline job %d cancelled for user %d", job_id, user_id)
+            await asyncio.to_thread(advance_job, job_id, "failed", error_msg="cancelled")
         except Exception as e:
-            logger.exception("Pipeline error")
+            logger.exception("Pipeline job %d error", job_id)
+            await asyncio.to_thread(advance_job, job_id, "failed", error_msg=str(e))
             await update.message.reply_text(_msg(context, "error", err=e))
         finally:
             global PIPELINE_QUEUE_COUNT
@@ -1280,6 +1350,467 @@ async def collection_question_handler(update: Update, context: ContextTypes.DEFA
     return FOLLOW_UP
 
 
+async def retry_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """/retry — Resume any stuck pipeline jobs for this user.
+
+    If a previous video was fully processed but Telegram send failed, this
+    resends the summary without re-downloading or re-transcribing.
+    If a job failed mid-way, it reports the failure step.
+    """
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+
+    try:
+        stuck = await asyncio.to_thread(get_stuck_jobs, user_id)
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Could not check for stuck jobs: {e}")
+        return FOLLOW_UP if context.user_data.get("transcript") else WAITING_FOR_URL
+
+    if not stuck:
+        await update.message.reply_text("✅ No stuck jobs found — everything completed successfully.")
+        return FOLLOW_UP if context.user_data.get("transcript") else WAITING_FOR_URL
+
+    await update.message.reply_text(
+        f"🔄 Found {len(stuck)} stuck job(s). Attempting to resume…"
+    )
+
+    for job in stuck:
+        job_id = job["id"]
+        step = job["step"]
+        video_url = job["video_url"]
+        summary_path = job.get("summary_path", "")
+        txt_path = job.get("txt_path", "")
+        title = job.get("title", "") or os.path.splitext(os.path.basename(txt_path))[0]
+
+        await update.message.reply_text(
+            f"📹 Job #{job_id}: `{title or video_url}`\n"
+            f"↳ Stuck at step: *{step}*",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+        # If summary already exists on disk — just resend it
+        if summary_path and os.path.exists(summary_path):
+            try:
+                with open(summary_path, "r", encoding="utf-8") as f:
+                    summary = f.read().strip()
+                with open(txt_path, "r", encoding="utf-8") as f:
+                    context.user_data["transcript"] = f.read().strip()
+
+                context.user_data["transcript_path"] = txt_path
+                context.user_data["summary_path"] = summary_path
+                context.user_data["video_url"] = video_url
+                context.user_data["video_title"] = title
+
+                await update.message.reply_text("📤 Resending summary…")
+                for chunk in _split_message(summary):
+                    await update.message.reply_text(chunk)
+
+                await asyncio.to_thread(advance_job, job_id, "done")
+                logger.info("Job %d resumed and marked done via /retry", job_id)
+
+                try:
+                    await asyncio.to_thread(
+                        add_video_history, user_id, title, video_url, txt_path, summary_path,
+                    )
+                except Exception:
+                    pass
+
+                try:
+                    collections = await asyncio.to_thread(get_collections)
+                except Exception:
+                    collections = []
+                if collections:
+                    await update.message.reply_text(
+                        _msg(context, "ask_collection"),
+                        reply_markup=_collection_keyboard(collections),
+                    )
+                else:
+                    await update.message.reply_text(
+                        _msg(context, "post_summary"),
+                        reply_markup=_post_summary_keyboard(),
+                    )
+
+            except Exception as e:
+                logger.exception("Retry send failed for job %d", job_id)
+                await update.message.reply_text(
+                    f"⚠️ Could not resend job #{job_id}: {e}\n"
+                    f"Send the URL again to reprocess: `{video_url}`",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+        else:
+            # Files missing — reset job to pending and reprocess from the URL
+            await asyncio.to_thread(
+                advance_job, job_id, "pending",
+                wav_path="", txt_path="", summary_path="", error_msg="",
+            )
+            await update.message.reply_text(
+                f"📥 Job #{job_id} output files are missing — reprocessing from URL…\n`{video_url}`",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+
+            MAX_RETRIES = {"downloading": 3, "transcribing": 2, "summarizing": 2, "sending": 3}
+
+            async def _retry(step: str, fn, *args, **kwargs):
+                retries = MAX_RETRIES.get(step, 2)
+                for attempt in range(1, retries + 1):
+                    try:
+                        result = await fn(*args, **kwargs)
+                        if result:
+                            return result
+                        raise ValueError("empty result")
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        await asyncio.to_thread(increment_retry, job_id)
+                        if attempt < retries:
+                            await asyncio.sleep(2 ** attempt)
+                        else:
+                            await asyncio.to_thread(
+                                advance_job, job_id, "failed", error_msg=str(e)
+                            )
+                            return None
+
+            try:
+                async with PIPELINE_SEMAPHORE:
+                    # Step 1: Download
+                    await asyncio.to_thread(advance_job, job_id, "downloading")
+                    await update.message.reply_text(_msg(context, "step1"))
+                    wav_path_new = await _retry(
+                        "downloading",
+                        asyncio.to_thread, download_youtube_audio_as_wav, video_url, DOWNLOADS_DIR,
+                    )
+                    if not wav_path_new:
+                        await update.message.reply_text(_msg(context, "dl_fail"))
+                        continue
+                    await asyncio.to_thread(advance_job, job_id, "transcribing", wav_path=wav_path_new)
+
+                    # Step 2: Transcribe
+                    await update.message.reply_text(_msg(context, "step2"))
+                    lang = _lang(context)
+
+                    async def _do_transcribe_retry():
+                        return await _transcribe_with_keepalive(
+                            wav_path_new, update.effective_chat.id, context.bot, lang=lang,
+                        )
+
+                    txt_path_new = await _retry("transcribing", _do_transcribe_retry)
+                    if not txt_path_new:
+                        await update.message.reply_text(_msg(context, "tx_fail"))
+                        continue
+
+                    title_new = os.path.splitext(os.path.basename(txt_path_new))[0]
+                    await asyncio.to_thread(
+                        advance_job, job_id, "summarizing",
+                        title=title_new, txt_path=txt_path_new,
+                    )
+
+                    # Step 3: Summarize
+                    await update.message.reply_text(_msg(context, "step3"))
+                    summary_path_new = await _retry(
+                        "summarizing",
+                        asyncio.to_thread,
+                        summarize_file, txt_path_new, SUMMARIES_DIR,
+                        DEFAULT_LLM_MODEL, True, None, lang,
+                    )
+                    if not summary_path_new:
+                        await update.message.reply_text(_msg(context, "sum_fail"))
+                        continue
+                    await asyncio.to_thread(
+                        advance_job, job_id, "sending", summary_path=summary_path_new,
+                    )
+
+                    # Step 4: Send
+                    with open(txt_path_new, "r", encoding="utf-8") as f:
+                        context.user_data["transcript"] = f.read().strip()
+                    with open(summary_path_new, "r", encoding="utf-8") as f:
+                        summary_new = f.read().strip()
+
+                    context.user_data["transcript_path"] = txt_path_new
+                    context.user_data["summary_path"] = summary_path_new
+                    context.user_data["video_url"] = video_url
+                    context.user_data["video_title"] = title_new
+
+                    await update.message.reply_text(_msg(context, "done"))
+                    for chunk in _split_message(summary_new):
+                        await update.message.reply_text(chunk)
+
+                    await asyncio.to_thread(advance_job, job_id, "done")
+
+                    try:
+                        await asyncio.to_thread(
+                            add_video_history, user_id, title_new,
+                            video_url, txt_path_new, summary_path_new,
+                        )
+                    except Exception:
+                        pass
+
+                    try:
+                        collections = await asyncio.to_thread(get_collections)
+                    except Exception:
+                        collections = []
+                    if collections:
+                        await update.message.reply_text(
+                            _msg(context, "ask_collection"),
+                            reply_markup=_collection_keyboard(collections),
+                        )
+                    else:
+                        await update.message.reply_text(
+                            _msg(context, "post_summary"),
+                            reply_markup=_post_summary_keyboard(),
+                        )
+
+            except Exception as e:
+                logger.exception("Retry reprocess failed for job %d", job_id)
+                await asyncio.to_thread(advance_job, job_id, "failed", error_msg=str(e))
+                await update.message.reply_text(
+                    f"⚠️ Reprocessing job #{job_id} failed: {e}", parse_mode=ParseMode.MARKDOWN,
+                )
+
+    return FOLLOW_UP if context.user_data.get("transcript") else WAITING_FOR_URL
+
+
+async def subscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """/subscribe <channel_url> [HH:MM] [-- custom prompt]
+    Subscribe to a YouTube channel. Bot will send you a daily briefing when a new video is posted.
+    Default schedule: 07:00 IST. Pass a time like 09:30 to change it.
+    Optionally append a custom summarization prompt after ' -- '.
+    Examples:
+      /subscribe https://www.youtube.com/@BBCNews
+      /subscribe https://www.youtube.com/@BBCNews 08:00
+      /subscribe https://www.youtube.com/@BBCNews 08:00 -- Give me 3 key world news headlines from this video.
+    """
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            "Usage: `/subscribe <channel_url> [HH:MM] [-- custom prompt]`\n\n"
+            "Examples:\n"
+            "• `/subscribe https://www.youtube.com/@BBCNews`\n"
+            "• `/subscribe https://www.youtube.com/@BBCNews 08:00`\n"
+            "• `/subscribe https://www.youtube.com/@BBCNews 08:00 -- Give me the top 3 headlines.`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return FOLLOW_UP if context.user_data.get("transcript") else WAITING_FOR_URL
+
+    # Parse: first arg is channel_url, optional second is HH:MM, rest is custom prompt
+    channel_url = args[0]
+    run_time = "07:00"
+    custom_prompt = None
+
+    remaining = args[1:]
+    if remaining and len(remaining[0]) == 5 and remaining[0][2] == ":":
+        run_time = remaining[0]
+        remaining = remaining[1:]
+
+    # Join rest as custom prompt (after "--" separator if present)
+    if remaining:
+        joined = " ".join(remaining).lstrip("- ").strip()
+        if joined:
+            custom_prompt = joined + "\n\n{text}"
+
+    chat_id = str(update.effective_chat.id)
+    try:
+        await asyncio.to_thread(add_subscription, chat_id, channel_url, run_time, custom_prompt)
+    except Exception as e:
+        logger.exception("subscribe_command DB error")
+        await update.message.reply_text(f"⚠️ Could not save subscription: {e}")
+        return FOLLOW_UP if context.user_data.get("transcript") else WAITING_FOR_URL
+
+    prompt_note = f"\n📝 Custom prompt: _{custom_prompt[:80]}…_" if custom_prompt else ""
+    await update.message.reply_text(
+        f"✅ Subscribed to:\n`{channel_url}`\n\n"
+        f"⏰ Daily check at *{run_time} IST*{prompt_note}\n\n"
+        f"I'll send you a briefing whenever a new video is posted. "
+        f"Use /unsubscribe to remove it.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    return FOLLOW_UP if context.user_data.get("transcript") else WAITING_FOR_URL
+
+
+async def unsubscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """/unsubscribe <channel_url> — remove a subscription."""
+    args = context.args or []
+    chat_id = str(update.effective_chat.id)
+
+    if not args:
+        # Show current subscriptions with inline list
+        try:
+            subs = await asyncio.to_thread(load_subscriptions)
+        except Exception as e:
+            await update.message.reply_text(f"⚠️ DB unavailable: {e}")
+            return FOLLOW_UP if context.user_data.get("transcript") else WAITING_FOR_URL
+
+        user_subs = [s for s in subs if s["telegram_chat_id"] == chat_id]
+        if not user_subs:
+            await update.message.reply_text("📭 You have no active subscriptions.")
+            return FOLLOW_UP if context.user_data.get("transcript") else WAITING_FOR_URL
+
+        lines = [f"• `{s['channel_url']}` — {s['run_time']} IST" for s in user_subs]
+        await update.message.reply_text(
+            "Your subscriptions:\n\n" + "\n".join(lines) +
+            "\n\nUse `/unsubscribe <channel_url>` to remove one.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return FOLLOW_UP if context.user_data.get("transcript") else WAITING_FOR_URL
+
+    channel_url = args[0]
+    try:
+        removed = await asyncio.to_thread(remove_subscription, chat_id, channel_url)
+    except Exception as e:
+        logger.exception("unsubscribe_command DB error")
+        await update.message.reply_text(f"⚠️ Could not remove subscription: {e}")
+        return FOLLOW_UP if context.user_data.get("transcript") else WAITING_FOR_URL
+
+    if removed:
+        await update.message.reply_text(f"✅ Unsubscribed from:\n`{channel_url}`", parse_mode=ParseMode.MARKDOWN)
+    else:
+        await update.message.reply_text(f"⚠️ No subscription found for:\n`{channel_url}`", parse_mode=ParseMode.MARKDOWN)
+
+    return FOLLOW_UP if context.user_data.get("transcript") else WAITING_FOR_URL
+
+
+async def latest_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """/latest <channel_url> [-- custom prompt]
+    Immediately fetch and summarize the latest video from a channel.
+    Optionally pass a custom prompt after ' -- '.
+    """
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            "Usage: `/latest <channel_url> [-- custom prompt]`\n\n"
+            "Example: `/latest https://www.youtube.com/@BBCNews`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return FOLLOW_UP if context.user_data.get("transcript") else WAITING_FOR_URL
+
+    channel_url = args[0]
+    custom_prompt = None
+    remaining = args[1:]
+    if remaining:
+        joined = " ".join(remaining).lstrip("- ").strip()
+        if joined:
+            custom_prompt = joined + "\n\n{text}"
+
+    chat_id = update.effective_chat.id
+    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+
+    await update.message.reply_text(
+        f"🔍 Fetching latest video from:\n`{channel_url}`\n\nThis may take a few minutes…",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+    async def _run_latest():
+        try:
+            # Step 1: Get latest video
+            video = await asyncio.to_thread(get_latest_video, channel_url)
+            if not video:
+                await update.message.reply_text("⚠️ Could not find any videos for that channel.")
+                return
+
+            await update.message.reply_text(
+                f"📺 Found: *{video['title']}*\n📥 Downloading audio…",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+
+            async with PIPELINE_SEMAPHORE:
+                # Step 2: Download
+                wav_path = await asyncio.to_thread(
+                    download_youtube_audio_as_wav, video["url"], DOWNLOADS_DIR
+                )
+                if not wav_path:
+                    await update.message.reply_text("❌ Download failed.")
+                    return
+
+                # Step 3: Transcribe
+                await update.message.reply_text("📝 Transcribing…")
+                txt_path = await _transcribe_with_keepalive(wav_path, chat_id, context.bot)
+                if not txt_path:
+                    await update.message.reply_text("❌ Transcription failed.")
+                    return
+
+                # Step 4: Summarize
+                await update.message.reply_text("🧠 Summarizing…")
+                summary_path = await asyncio.to_thread(
+                    summarize_file, txt_path, SUMMARIES_DIR, DEFAULT_LLM_MODEL, True, custom_prompt
+                )
+                if not summary_path:
+                    await update.message.reply_text("❌ Summarization failed.")
+                    return
+
+            with open(summary_path, "r", encoding="utf-8") as f:
+                summary_text = f.read().strip()
+
+            await update.message.reply_text(f"✅ *{video['title']}*", parse_mode=ParseMode.MARKDOWN)
+            for chunk in _split_message(summary_text):
+                await update.message.reply_text(chunk)
+
+            # Store in context so user can ask follow-up questions
+            with open(txt_path, "r", encoding="utf-8") as f:
+                context.user_data["transcript"] = f.read().strip()
+            context.user_data["transcript_path"] = txt_path
+            context.user_data["summary_path"] = summary_path
+            context.user_data["video_url"] = video["url"]
+            context.user_data["video_title"] = video["title"]
+
+            await update.message.reply_text(
+                "💬 Ask me anything about this video, or /new to switch.",
+                reply_markup=_post_summary_keyboard(),
+            )
+
+        except Exception as e:
+            logger.exception("/latest pipeline failed")
+            await update.message.reply_text(f"⚠️ Something went wrong: {e}")
+
+    asyncio.create_task(_run_latest())
+    return FOLLOW_UP
+
+
+async def sendnow_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """/sendnow <channel_url> — immediately fetch and send the latest video briefing, bypassing schedule."""
+    args = context.args or []
+    if not args:
+        # Show subscriptions and let user pick
+        try:
+            subs = await asyncio.to_thread(load_subscriptions)
+        except Exception as e:
+            await update.message.reply_text(f"⚠️ DB error: {e}")
+            return FOLLOW_UP if context.user_data.get("transcript") else WAITING_FOR_URL
+
+        chat_id = str(update.effective_chat.id)
+        user_subs = [s for s in subs if s["telegram_chat_id"] == chat_id]
+        if not user_subs:
+            await update.message.reply_text(
+                "You have no subscriptions. Use `/subscribe <channel_url>` first.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return FOLLOW_UP if context.user_data.get("transcript") else WAITING_FOR_URL
+
+        lines = [f"• `{s['channel_url']}`" for s in user_subs]
+        await update.message.reply_text(
+            "Usage: `/sendnow <channel_url>`\n\nYour subscriptions:\n" + "\n".join(lines),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return FOLLOW_UP if context.user_data.get("transcript") else WAITING_FOR_URL
+
+    channel_url = args[0]
+    chat_id = update.effective_chat.id
+
+    # Find custom prompt for this subscription if it exists
+    try:
+        subs = await asyncio.to_thread(load_subscriptions)
+        sub = next((s for s in subs if s["channel_url"] == channel_url
+                    and s["telegram_chat_id"] == str(chat_id)), None)
+        custom_prompt = sub["custom_prompt"] if sub else None
+    except Exception:
+        custom_prompt = None
+
+    await update.message.reply_text(
+        f"🚀 Fetching latest video from:\n`{channel_url}`",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    asyncio.create_task(_force_dispatch_channel(context.bot, channel_url, chat_id, custom_prompt))
+    return FOLLOW_UP if context.user_data.get("transcript") else WAITING_FOR_URL
+
+
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """/status — show current batch progress."""
     user_id = update.effective_user.id
@@ -1324,18 +1855,243 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text("An unexpected error occurred.")
 
 
+async def _force_dispatch_channel(bot, channel_url: str, chat_id: str,
+                                   custom_prompt: str | None = None) -> bool:
+    """
+    Immediately fetch, summarize and send the latest video from channel_url to chat_id.
+    Ignores last_sent_video_id (always sends). Updates last_sent_video_id after success.
+    Returns True on success.
+    """
+    try:
+        video = await asyncio.to_thread(get_latest_video, channel_url)
+        if not video:
+            await bot.send_message(chat_id, f"⚠️ Could not find any videos for:\n{channel_url}")
+            return False
+
+        video_id = video["id"]
+        await bot.send_message(
+            chat_id,
+            f"📺 Found: *{video['title']}*\n📥 Downloading…",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+        async with PIPELINE_SEMAPHORE:
+            wav_path = await asyncio.to_thread(
+                download_youtube_audio_as_wav, video["url"], DOWNLOADS_DIR
+            )
+            if not wav_path:
+                await bot.send_message(chat_id, "❌ Download failed.")
+                return False
+
+            await bot.send_message(chat_id, "📝 Transcribing…")
+            txt_path = await asyncio.to_thread(transcribe_file, wav_path, DEFAULT_WHISPER_MODEL)
+            if not txt_path:
+                await bot.send_message(chat_id, "❌ Transcription failed.")
+                return False
+
+            await bot.send_message(chat_id, "🧠 Summarizing…")
+            summary_path = await asyncio.to_thread(
+                summarize_file, txt_path, SUMMARIES_DIR, DEFAULT_LLM_MODEL, True, custom_prompt
+            )
+            if not summary_path:
+                await bot.send_message(chat_id, "❌ Summarization failed.")
+                return False
+
+        with open(summary_path, "r", encoding="utf-8") as f:
+            summary_text = f.read().strip()
+
+        highlights = await asyncio.to_thread(extract_highlights, summary_text, DEFAULT_LLM_MODEL)
+        video_title_line = summary_text.splitlines()[0] if summary_text else video["title"]
+        header = f"☀️ *Latest Briefing*\n\n📺 {video_title_line}\n\n*Key Highlights:*\n"
+        token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+        await send_telegram_message(token, str(chat_id), header + highlights)
+
+        # Update last sent so scheduler won't re-send
+        await asyncio.to_thread(update_subscription_last_sent, str(chat_id), channel_url, video_id)
+        logger.info("force_dispatch done: chat=%s video=%s", chat_id, video_id)
+        return True
+
+    except Exception:
+        logger.exception("force_dispatch failed: chat=%s channel=%s", chat_id, channel_url)
+        await bot.send_message(chat_id, "⚠️ Something went wrong during dispatch.")
+        return False
+
+
+async def _run_subscription_pipeline_bot(sub: dict) -> tuple[str, str] | None:
+    """
+    Run the full pipeline for one subscription inside the bot process.
+    Returns (video_id, summary_text) or None if skipped/failed.
+    """
+    import datetime as dt
+    channel_url = sub["channel_url"]
+    chat_id = sub["telegram_chat_id"]
+    last_sent_video_id = sub.get("last_sent_video_id")
+    custom_prompt = sub.get("custom_prompt")
+
+    try:
+        video = await asyncio.to_thread(get_latest_video, channel_url)
+        if not video:
+            return None
+
+        video_id = video["id"]
+        if last_sent_video_id and video_id == last_sent_video_id:
+            logger.info("Subscription: no new video for chat=%s channel=%s", chat_id, channel_url)
+            return None
+
+        async with PIPELINE_SEMAPHORE:
+            wav_path = await asyncio.to_thread(
+                download_youtube_audio_as_wav, video["url"], DOWNLOADS_DIR
+            )
+            if not wav_path:
+                return None
+
+            txt_path = await asyncio.to_thread(transcribe_file, wav_path, DEFAULT_WHISPER_MODEL)
+            if not txt_path:
+                return None
+
+            summary_path = await asyncio.to_thread(
+                summarize_file, txt_path, SUMMARIES_DIR, DEFAULT_LLM_MODEL, True, custom_prompt
+            )
+            if not summary_path:
+                return None
+
+            with open(summary_path, "r", encoding="utf-8") as f:
+                return video_id, f.read().strip()
+
+    except Exception:
+        logger.exception("Subscription pipeline failed: chat=%s channel=%s", chat_id, channel_url)
+        return None
+
+
+async def _dispatch_subscription_bot(bot, sub: dict) -> None:
+    """Fetch, summarize and send a channel briefing via Telegram."""
+    chat_id = sub["telegram_chat_id"]
+    channel_url = sub["channel_url"]
+
+    result = await _run_subscription_pipeline_bot(sub)
+    if result is None:
+        return  # no new video or pipeline error — silently skip
+
+    video_id, summary_text = result
+
+    highlights = await asyncio.to_thread(extract_highlights, summary_text, DEFAULT_LLM_MODEL)
+    video_title_line = summary_text.splitlines()[0] if summary_text else ""
+    header = f"☀️ *Daily Briefing*\n\n📺 {video_title_line}\n\n*Key Highlights:*\n"
+    message = header + highlights
+
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    await send_telegram_message(token, chat_id, message)
+    await asyncio.to_thread(update_subscription_last_sent, chat_id, channel_url, video_id)
+    logger.info("Subscription briefing sent: chat=%s video=%s", chat_id, video_id)
+
+
+async def _subscription_scheduler_bot(bot) -> None:
+    """
+    Long-running task inside the bot process.
+    Wakes every minute, fires subscriptions whose HH:MM IST matches now.
+    Deduplicates within the same day.
+    """
+    import datetime as dt
+    import zoneinfo
+    IST = zoneinfo.ZoneInfo("Asia/Kolkata")
+    fired_today: set[tuple[str, str, str]] = set()
+
+    logger.info("Subscription scheduler started inside bot process.")
+
+    while True:
+        now = dt.datetime.now(IST)
+        today = now.strftime("%Y-%m-%d")
+        current_hhmm = now.strftime("%H:%M")
+
+        # Reset at midnight
+        fired_today = {k for k in fired_today if k[2] == today}
+
+        try:
+            subs = await asyncio.to_thread(load_subscriptions)
+            for sub in subs:
+                if not sub.get("enabled", True):
+                    continue
+                run_time = sub.get("run_time", "07:00")
+                key = (sub["telegram_chat_id"], sub["channel_url"], today)
+                if run_time == current_hhmm and key not in fired_today:
+                    fired_today.add(key)
+                    logger.info("Firing subscription: chat=%s channel=%s", sub["telegram_chat_id"], sub["channel_url"])
+                    asyncio.create_task(_dispatch_subscription_bot(bot, sub))
+        except Exception:
+            logger.exception("Subscription scheduler error")
+
+        await asyncio.sleep(60 - now.second)
+
+
+async def _auto_bootstrap(bot) -> None:
+    """
+    On startup: ensure admin has at least one subscription, then immediately
+    send the latest video if it hasn't been sent yet.
+    """
+    try:
+        from app.db.core import get_secret
+        admin_chat_id = get_secret("ADMIN_CHAT_ID")
+        if not admin_chat_id:
+            logger.warning("ADMIN_CHAT_ID not set — skipping auto-bootstrap")
+            return
+
+        DLS_URL = "https://www.youtube.com/@DLSNews/videos"
+
+        # Ensure subscription exists for admin
+        subs = await asyncio.to_thread(load_subscriptions)
+        admin_subs = [s for s in subs if s["telegram_chat_id"] == admin_chat_id]
+        dls_sub = next((s for s in admin_subs if s["channel_url"] == DLS_URL), None)
+
+        if not dls_sub:
+            logger.info("Auto-creating DLS News subscription for admin chat %s", admin_chat_id)
+            await asyncio.to_thread(add_subscription, admin_chat_id, DLS_URL, "07:00")
+            dls_sub = {"telegram_chat_id": admin_chat_id, "channel_url": DLS_URL,
+                       "run_time": "07:00", "enabled": True,
+                       "last_sent_video_id": None, "custom_prompt": None}
+            await bot.send_message(
+                admin_chat_id,
+                f"🔔 Auto-subscribed to *DLS News* daily briefings at 07:00 IST.\n`{DLS_URL}`",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+
+        # Send latest video immediately if not already sent
+        latest = await asyncio.to_thread(
+            get_latest_video, DLS_URL
+        )
+        if latest and latest["id"] != dls_sub.get("last_sent_video_id"):
+            logger.info("Auto-bootstrap: sending latest DLS video %s", latest["id"])
+            await _force_dispatch_channel(bot, DLS_URL, admin_chat_id)
+        else:
+            logger.info("Auto-bootstrap: latest video already sent, skipping")
+
+    except Exception:
+        logger.exception("Auto-bootstrap failed")
+
+
 async def post_init(app: Application) -> None:
+    # Schedule subscription scheduler + auto-bootstrap to start 3s after polling begins
+    async def _delayed_start():
+        await asyncio.sleep(3)
+        asyncio.create_task(_subscription_scheduler_bot(app.bot))
+        asyncio.create_task(_auto_bootstrap(app.bot))
+
+    asyncio.get_event_loop().create_task(_delayed_start())
+
     await app.bot.set_my_commands([
-        BotCommand("start",    "Start or restart the bot"),
-        BotCommand("new",      "Summarize a new video"),
-        BotCommand("history",  "Browse your past videos"),
-        BotCommand("clear",    "Delete all your videos and files"),
-        BotCommand("language", "Change response language"),
-        BotCommand("quiz",     "Get quiz questions from a collection"),
-        BotCommand("ask",      "Ask a question from your knowledge base"),
-        BotCommand("status",   "Check background processing progress"),
-        BotCommand("help",     "What can this bot do?"),
-        BotCommand("cancel",   "Cancel current operation"),
+        BotCommand("start",       "Start or restart the bot"),
+        BotCommand("new",         "Summarize a new video"),
+        BotCommand("latest",      "Fetch & summarize latest video from a channel"),
+        BotCommand("subscribe",   "Subscribe to a channel for daily briefings"),
+        BotCommand("unsubscribe", "Remove a channel subscription"),
+        BotCommand("history",     "Browse your past videos"),
+        BotCommand("clear",       "Delete all your videos and files"),
+        BotCommand("language",    "Change response language"),
+        BotCommand("quiz",        "Get quiz questions from a collection"),
+        BotCommand("ask",         "Ask a question from your knowledge base"),
+        BotCommand("sendnow",     "Send latest video briefing from a subscribed channel now"),
+        BotCommand("status",      "Check background processing progress"),
+        BotCommand("help",        "What can this bot do?"),
+        BotCommand("cancel",      "Cancel current operation"),
     ])
 
 
@@ -1351,6 +2107,8 @@ def main():
     try:
         ensure_history_table()
         ensure_collections_tables()
+        ensure_subscriptions_table()
+        ensure_pipeline_jobs_table()
     except Exception:
         logger.warning("Could not create DB tables — DB may be unavailable.")
 
@@ -1358,15 +2116,20 @@ def main():
 
     conv_handler = ConversationHandler(
         entry_points=[
-            CommandHandler("start",   start),
-            CommandHandler("new",     new_video),
-            CommandHandler("help",    help_command),
-            CommandHandler("history", history_command),
-            CommandHandler("clear",   clear_history_prompt),
-            CommandHandler("quiz",    quiz_command),
-            CommandHandler("ask",     ask_collection_command),
-            CommandHandler("status",  status_command),
-            CommandHandler("cancel",  cancel),
+            CommandHandler("start",       start),
+            CommandHandler("new",         new_video),
+            CommandHandler("help",        help_command),
+            CommandHandler("history",     history_command),
+            CommandHandler("clear",       clear_history_prompt),
+            CommandHandler("quiz",        quiz_command),
+            CommandHandler("ask",         ask_collection_command),
+            CommandHandler("status",      status_command),
+            CommandHandler("subscribe",   subscribe_command),
+            CommandHandler("unsubscribe", unsubscribe_command),
+            CommandHandler("latest",      latest_command),
+            CommandHandler("sendnow",     sendnow_command),
+            CommandHandler("retry",       retry_command),
+            CommandHandler("cancel",      cancel),
         ],
         states={
             WAITING_FOR_KEY: [
@@ -1383,9 +2146,14 @@ def main():
                 CommandHandler("history", history_command),
             ],
             WAITING_FOR_URL: [
-                CommandHandler("start",   start),
-                CommandHandler("cancel",  cancel),
-                CommandHandler("status",  status_command),
+                CommandHandler("start",       start),
+                CommandHandler("cancel",      cancel),
+                CommandHandler("status",      status_command),
+                CommandHandler("subscribe",   subscribe_command),
+                CommandHandler("unsubscribe", unsubscribe_command),
+                CommandHandler("latest",      latest_command),
+                CommandHandler("sendnow",     sendnow_command),
+                CommandHandler("retry",       retry_command),
                 CallbackQueryHandler(set_language, pattern=r"^lang:"),
                 CommandHandler("language", language_command),
                 CommandHandler("history", history_command),
@@ -1423,15 +2191,20 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, collection_question_handler),
             ],
             FOLLOW_UP: [
-                CommandHandler("start",    start),
-                CommandHandler("cancel",   cancel),
-                CommandHandler("new",      new_video),
-                CommandHandler("language", language_command),
-                CommandHandler("history",  history_command),
-                CommandHandler("clear",    clear_history_prompt),
-                CommandHandler("quiz",     quiz_command),
-                CommandHandler("ask",      ask_collection_command),
-                CommandHandler("status",   status_command),
+                CommandHandler("start",       start),
+                CommandHandler("cancel",      cancel),
+                CommandHandler("new",         new_video),
+                CommandHandler("language",    language_command),
+                CommandHandler("history",     history_command),
+                CommandHandler("clear",       clear_history_prompt),
+                CommandHandler("quiz",        quiz_command),
+                CommandHandler("ask",         ask_collection_command),
+                CommandHandler("status",      status_command),
+                CommandHandler("subscribe",   subscribe_command),
+                CommandHandler("unsubscribe", unsubscribe_command),
+                CommandHandler("latest",      latest_command),
+                CommandHandler("sendnow",     sendnow_command),
+                CommandHandler("retry",       retry_command),
                 CallbackQueryHandler(set_language,               pattern=r"^lang:"),
                 CallbackQueryHandler(new_video,                  pattern=r"^action:new_video$"),
                 CallbackQueryHandler(switch_language_callback,   pattern=r"^action:switch_lang$"),

@@ -16,7 +16,6 @@ from dataclasses import dataclass, field
 from typing import AsyncGenerator
 from uuid import uuid4
 
-import ollama
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Form, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
@@ -26,6 +25,7 @@ from itsdangerous import BadSignature, SignatureExpired, TimestampSigner
 
 from app.db import (
     add_subscription, get_secret, load_subscriptions, remove_subscription,
+    update_subscription_last_sent, ensure_subscriptions_table,
     get_allowed_users, add_allowed_user, remove_allowed_user,
     get_collections, get_collection_by_name, get_collection_by_id,
     create_collection, delete_collection,
@@ -108,6 +108,7 @@ os.makedirs(SUMMARIES_DIR, exist_ok=True)
 @app.on_event("startup")
 async def _start_scheduler():
     ensure_collections_tables()
+    ensure_subscriptions_table()
     os.makedirs(KNOWLEDGE_DIR, exist_ok=True)
     asyncio.create_task(_subscription_scheduler())
     asyncio.create_task(_quiz_scheduler())
@@ -336,23 +337,38 @@ async def _run_pipeline(job_id: str):
 # ---------------------------------------------------------------------------
 # Scheduled subscription runner
 # ---------------------------------------------------------------------------
-async def _run_subscription_pipeline(sub: dict) -> str | None:
+async def _run_subscription_pipeline(sub: dict) -> tuple[str, str] | None:
     """
     Run the full pipeline for a subscription's channel URL.
     Acquires PIPELINE_SEMAPHORE so it never runs concurrently with another
     pipeline (web-submitted or another subscription).
-    Returns the summary text if successful, None otherwise.
+
+    Skips processing if the latest video is the same as last_sent_video_id.
+    Returns (video_id, summary_text) on success, None if skipped or failed.
     """
     channel_url = sub["channel_url"]
     chat_id = sub["telegram_chat_id"]
+    last_sent_video_id = sub.get("last_sent_video_id")
+    custom_prompt = sub.get("custom_prompt")  # user-defined prompt for this channel
 
     try:
-        async with PIPELINE_SEMAPHORE:
-            video = await asyncio.to_thread(get_latest_video, channel_url)
-            if not video:
-                return None
-            url = video["url"]
+        # Fetch latest video metadata (fast, no semaphore needed)
+        video = await asyncio.to_thread(get_latest_video, channel_url)
+        if not video:
+            return None
 
+        video_id = video["id"]
+        url = video["url"]
+
+        # Skip if this is the same video we already sent
+        if last_sent_video_id and video_id == last_sent_video_id:
+            logging.getLogger(__name__).info(
+                "Subscription skipped (no new video): chat=%s channel=%s video_id=%s",
+                chat_id, channel_url, video_id,
+            )
+            return None
+
+        async with PIPELINE_SEMAPHORE:
             wav_path = await asyncio.to_thread(download_youtube_audio_as_wav, url, DOWNLOADS_DIR)
             if not wav_path:
                 return None
@@ -362,16 +378,15 @@ async def _run_subscription_pipeline(sub: dict) -> str | None:
                 return None
 
             summary_path = await asyncio.to_thread(
-                summarize_file, txt_path, SUMMARIES_DIR, DEFAULT_LLM_MODEL, True, None
+                summarize_file, txt_path, SUMMARIES_DIR, DEFAULT_LLM_MODEL, True, custom_prompt
             )
             if not summary_path:
                 return None
 
             with open(summary_path, "r", encoding="utf-8") as f:
-                return f.read().strip()
+                return video_id, f.read().strip()
 
     except Exception:
-        import logging
         logging.getLogger(__name__).exception(
             "Subscription pipeline failed for chat_id=%s channel=%s", chat_id, channel_url
         )
@@ -386,13 +401,14 @@ async def _dispatch_subscription(sub: dict) -> None:
     chat_id = sub["telegram_chat_id"]
     channel_url = sub["channel_url"]
 
-    summary_text = await _run_subscription_pipeline(sub)
-    if not summary_text:
-        await send_telegram_message(
-            TELEGRAM_BOT_TOKEN, chat_id,
-            f"⚠️ Could not fetch/summarize the latest video from:\n{channel_url}"
-        )
+    result = await _run_subscription_pipeline(sub)
+    if result is None:
+        # None means either no new video (silently skip) or pipeline error
+        # We only send an error message if we're sure there was a failure,
+        # not if we just skipped because no new video was found.
         return
+
+    video_id, summary_text = result
 
     highlights = await asyncio.to_thread(extract_highlights, summary_text, DEFAULT_LLM_MODEL)
 
@@ -402,6 +418,9 @@ async def _dispatch_subscription(sub: dict) -> None:
     message = header + highlights
 
     await send_telegram_message(TELEGRAM_BOT_TOKEN, chat_id, message)
+
+    # Record the sent video so we don't resend it tomorrow
+    await asyncio.to_thread(update_subscription_last_sent, chat_id, channel_url, video_id)
 
 
 async def _subscription_scheduler() -> None:

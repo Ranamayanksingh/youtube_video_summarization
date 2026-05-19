@@ -11,10 +11,22 @@ from app.db.history import (
     delete_user_history,
     get_user_history,
 )
+from app.db.pipeline_jobs import (
+    ensure_pipeline_jobs_table,
+    create_job,
+    advance_job,
+    increment_retry,
+    get_job,
+    get_stuck_jobs,
+    get_all_stuck_jobs,
+    get_recent_jobs,
+)
 from app.db.subscriptions import (
+    ensure_subscriptions_table,
     load_subscriptions,
     add_subscription,
     remove_subscription,
+    update_subscription_last_sent,
 )
 from app.db.users import (
     ensure_allowed_users_table,
@@ -47,7 +59,11 @@ __all__ = [
     "get_conn", "get_secret", "set_secret",
     "ensure_history_table", "add_video_history",
     "delete_user_history", "get_user_history",
-    "load_subscriptions", "add_subscription", "remove_subscription",
+    "ensure_pipeline_jobs_table", "create_job", "advance_job",
+    "increment_retry", "get_job", "get_stuck_jobs",
+    "get_all_stuck_jobs", "get_recent_jobs",
+    "ensure_subscriptions_table", "load_subscriptions",
+    "add_subscription", "remove_subscription", "update_subscription_last_sent",
     "ensure_allowed_users_table", "get_allowed_users",
     "add_allowed_user", "remove_allowed_user", "is_telegram_user_allowed",
     "ensure_collections_tables",

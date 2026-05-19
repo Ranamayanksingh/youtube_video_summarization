@@ -13,7 +13,7 @@ bash setup.sh        # one-time: installs all system deps, creates .venv, verifi
 source .venv/bin/activate
 ```
 
-Copy `example_env` to `.env` and fill in values. Secrets (bot token, web auth key) are stored in Postgres `app_secrets` table — seed them via `psql` or `db_seed.py`. The `.env` only needs Postgres credentials and `BOT_ACCESS_KEY`/`GROQ_API_KEY`.
+Copy `example_env` to `.env` and fill in values. Secrets (bot token, web auth key) are stored in Postgres `app_secrets` table — seed them via `psql` or `db_seed.py`. The `.env` only needs Postgres credentials and `BOT_ACCESS_KEY`/`GROQ_API_KEY` (or `NVIDIA_API_KEY` as an alternative LLM backend).
 
 System requirements: FFmpeg, Node.js (yt-dlp JS challenges), Google Chrome (cookie extraction), Postgres running locally.
 
@@ -87,13 +87,13 @@ tests/
 
 **Key design decisions:**
 
-- **LLM backend**: `app/pipeline/summarizer.py._llm_chat()` uses Groq (`llama-3.3-70b-versatile`) when `GROQ_API_KEY` is set, otherwise falls back to local Ollama. `DEFAULT_MODEL` in `summarizer.py` is the Groq model name.
+- **LLM backend**: `app/pipeline/summarizer.py._llm_chat()` uses Groq (`llama-3.3-70b-versatile`) when `GROQ_API_KEY` is set, NVIDIA NIM (`meta/llama-3.3-70b-instruct`) when `NVIDIA_API_KEY` is set, otherwise falls back to local Ollama. Priority: Groq → NVIDIA → Ollama. Groq free tier: transcripts are truncated to 32K chars to stay within token limits. `DEFAULT_MODEL` in `summarizer.py` is the Groq/shared model name.
 - **Secrets storage**: All runtime secrets (`TELEGRAM_BOT_TOKEN`, `WEB_AUTH_TOKEN`, `SECRET_KEY`) live in Postgres `app_secrets` table, fetched via `app.db.get_secret()`. Env vars are a fallback only.
 - **Concurrency**: Both `app/interfaces/bot.py` and `app/interfaces/web.py` use a single `asyncio.Semaphore(1)` named `PIPELINE_SEMAPHORE` — Whisper and LLM are single-instance; all pipeline calls use `asyncio.to_thread()`.
-- **Subscriptions**: `app/interfaces/web.py` runs `_subscription_scheduler()` as a background task on startup. It wakes every minute, checks `yt_subscriptions` table for matching `HH:MM` IST run times, and dispatches the pipeline + Telegram notification. Data is in Postgres, not `subscriptions.json`.
+- **Subscriptions**: `app/interfaces/web.py` runs `_subscription_scheduler()` as a background task on startup. It wakes every minute, checks `yt_subscriptions` table for matching `HH:MM` IST run times, and dispatches the pipeline + Telegram notification. Deduplication: `last_sent_video_id` is stored per subscription — the pipeline is skipped silently if the latest video hasn't changed. Each subscription supports an optional `custom_prompt` (overrides the default summarization prompt). Data is in Postgres, not `subscriptions.json`.
 - **Web auth**: Cookie-based with `itsdangerous.TimestampSigner`; 30-day expiry. Bearer token supported for API/curl access. `WEB_AUTH_TOKEN` from `app_secrets`.
 - **Bot access control**: Two layers — `BOT_ACCESS_KEY` (shared password in `.env`) and `allowed_telegram_users` Postgres table (per-user allowlist managed via `/allowed-users` web route).
-- **Transcription**: Always `task="translate"` so both Hindi and English audio produces English transcripts.
+- **Transcription**: Always `task="translate"` so both Hindi and English audio produces English transcripts. Backend priority: faster-whisper (local, `large-v3-turbo`) → AssemblyAI (cloud, `ASSEMBLYAI_API_KEY`) → Groq (cloud, `GROQ_API_KEY`) → mlx-whisper (local, last resort — may hang).
 - **Templates**: Jinja2 templates in `templates/`, partials in `templates/partials/`. HTMX is used for dynamic updates (job rows, Q&A, suggestions).
 
 ## Database Schema (Postgres)
@@ -117,8 +117,25 @@ tests/
 
 ## Models
 
-- **Transcription**: `mlx-community/whisper-large-v3-mlx` — cached at `~/.cache/huggingface/` after first run
-- **Summarization**: Groq `llama-3.3-70b-versatile` (preferred) or local Ollama `llama3`
+- **Transcription**: `faster-whisper` with `large-v3-turbo` (primary, local, cached at `~/.cache/huggingface/` after first run ~1.5 GB download); falls back to AssemblyAI → Groq → mlx-whisper
+- **Summarization**: Groq `llama-3.3-70b-versatile` (preferred), NVIDIA NIM `meta/llama-3.3-70b-instruct` (second), or local Ollama `llama3` (fallback)
+
+## Testing
+
+```bash
+# Run all integration tests
+python tests/test_pipeline.py
+
+# Run specific stages
+python tests/test_pipeline.py --stage imports      # check all dependencies
+python tests/test_pipeline.py --stage cookies     # validate YouTube cookies
+python tests/test_pipeline.py --stage download    # test audio download
+python tests/test_pipeline.py --stage transcribe  # test Whisper transcription
+python tests/test_pipeline.py --stage summarize   # test LLM summarization
+python tests/test_pipeline.py --stage bot_features  # test DB history, Q&A, quiz
+```
+
+Tests use a short public-domain video (~30s) and validate each pipeline stage independently. Exit code is 0 if all tests pass.
 
 ## Service Management (macOS launchd)
 
@@ -198,3 +215,5 @@ python -m app.knowledge.quiz --collection "SSC CGL Maths" --chat-id 123456789 --
 - **History storage**: Paths in `user_video_history` are relative paths prefixed with `data/` (e.g. `data/downloads/Title.txt`).
 - **`subscriptions.json`**: Legacy file; current data lives in Postgres `yt_subscriptions` table.
 - **`allowed_telegram_users` open-access rule**: If the table is empty, all users are allowed (see `db.is_telegram_user_allowed()`). Add at least one user to enforce the allowlist.
+- **Telegram subscription commands**: Bot supports `/subscribe <url> [HH:MM] [-- custom prompt]`, `/unsubscribe [url]`, `/latest <url>` (fetch latest video on demand), and `/sendnow <url>` (run pipeline immediately). These commands are available in both `WAITING_FOR_URL` and `FOLLOW_UP` conversation states.
+- **`extract_highlights()`**: Previously Ollama-only; now routes through `_llm_chat()` so it uses whatever backend is configured (Groq/NVIDIA/Ollama).

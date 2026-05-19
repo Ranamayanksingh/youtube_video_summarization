@@ -1,4 +1,25 @@
-TELEGRAM_BOT_TOKEN=
-ALLOWED_TELEGRAM_USER_IDS=
+# Postgres connection — all secrets (bot token, auth keys) live in app_secrets table
+POSTGRES_HOST=localhost
+POSTGRES_PORT=5432
+POSTGRES_DB=billbot_db
+POSTGRES_USER=billbot_user
+POSTGRES_PASSWORD=changeme
 
-# rename this file as .env when you use this in your project
+# Shared access key for the Telegram bot — share this with anyone you want to allow.
+# Leave empty to allow everyone without authentication.
+BOT_ACCESS_KEY=
+GROQ_API_KEY=
+NVIDIA_API_KEY=       # Optional — used if GROQ_API_KEY is not set. Get from build.nvidia.com
+ASSEMBLYAI_API_KEY=   # Optional — cloud transcription fallback. Get from assemblyai.com (100 hrs/month free)
+
+# Rename this file to .env when using in your project.
+#
+# To seed secrets into the database, run:
+#   python db_seed.py
+# or insert directly:
+#   psql -U billbot_user -d billbot_db -c "
+#     INSERT INTO app_secrets (key, value, note) VALUES
+#       ('TELEGRAM_BOT_TOKEN', '<your token>', 'From @BotFather'),
+#       ('WEB_AUTH_TOKEN',     '<your password>', 'Web UI login'),
+#       ('SECRET_KEY',         '<random string>', 'Cookie signing');
+#   "

@@ -4,17 +4,21 @@ Outputs .summary.txt files into the data/summaries/ folder.
 
 Groq is used when GROQ_API_KEY is set in .env. Falls back to Ollama otherwise.
 """
+import logging
 import os
 import glob
 import argparse
 
 from dotenv import load_dotenv
 
+logger = logging.getLogger(__name__)
+
 load_dotenv()
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-DEFAULT_MODEL = "llama-3.3-70b-versatile"  # Groq model
+DEFAULT_MODEL = "llama-3.3-70b-versatile"  # Groq / NVIDIA shared model name
+NVIDIA_DEFAULT_MODEL = "meta/llama-3.3-70b-instruct"  # NVIDIA NIM model name
 DEFAULT_DOWNLOADS_DIR = os.path.join(_PROJECT_ROOT, "data", "downloads")
 DEFAULT_SUMMARIES_DIR = os.path.join(_PROJECT_ROOT, "data", "summaries")
 
@@ -76,7 +80,12 @@ PROMPT_TEMPLATE_HINDI = """\
 
 
 def _llm_chat(model: str, prompt: str) -> str:
-    """Send a prompt to Groq if API key is set, otherwise fall back to Ollama."""
+    """
+    Send a prompt to an LLM backend. Priority:
+      1. Groq  (GROQ_API_KEY set)
+      2. NVIDIA NIM  (NVIDIA_API_KEY set)
+      3. Ollama  (local fallback)
+    """
     groq_key = os.environ.get("GROQ_API_KEY", "").strip()
     if groq_key:
         from groq import Groq
@@ -86,13 +95,28 @@ def _llm_chat(model: str, prompt: str) -> str:
             messages=[{"role": "user", "content": prompt}],
         )
         return response.choices[0].message.content.strip()
-    else:
-        import ollama
-        response = ollama.chat(
-            model=model,
+
+    nvidia_key = os.environ.get("NVIDIA_API_KEY", "").strip()
+    if nvidia_key:
+        from openai import OpenAI
+        client = OpenAI(
+            api_key=nvidia_key,
+            base_url="https://integrate.api.nvidia.com/v1",
+        )
+        # Use NVIDIA model name if the caller passed the Groq model name
+        nvidia_model = NVIDIA_DEFAULT_MODEL if model == DEFAULT_MODEL else model
+        response = client.chat.completions.create(
+            model=nvidia_model,
             messages=[{"role": "user", "content": prompt}],
         )
-        return response["message"]["content"].strip()
+        return response.choices[0].message.content.strip()
+
+    import ollama
+    response = ollama.chat(
+        model=model,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return response["message"]["content"].strip()
 
 
 def summarize_file(
@@ -114,12 +138,16 @@ def summarize_file(
         text = f.read().strip()
 
     if not text:
-        print(f"[SKIP] Empty file: {base_name}")
+        logger.warning("[SUMMARIZE] Empty transcript file: %s", base_name)
         return None
 
     groq_key = os.environ.get("GROQ_API_KEY", "").strip()
-    backend = "Groq" if groq_key else "Ollama"
-    print(f"[SUMMARIZING] {base_name} (lang={lang}, backend={backend}, model={model})")
+    nvidia_key = os.environ.get("NVIDIA_API_KEY", "").strip()
+    backend = "Groq" if groq_key else ("NVIDIA" if nvidia_key else "Ollama")
+    logger.info(
+        "[SUMMARIZE] Starting | file=%s | lang=%s | backend=%s | model=%s | chars=%d",
+        base_name, lang, backend, model, len(text),
+    )
 
     if prompt_template:
         template = prompt_template
@@ -128,16 +156,29 @@ def summarize_file(
     else:
         template = PROMPT_TEMPLATE
 
+    # Groq free tier: ~12K TPM limit. Cap transcript at ~32K chars (~8K tokens)
+    MAX_TRANSCRIPT_CHARS = 32_000
+    if groq_key and len(text) > MAX_TRANSCRIPT_CHARS:
+        logger.warning(
+            "[SUMMARIZE] Transcript too long (%d chars) — truncating to %d for Groq free tier",
+            len(text), MAX_TRANSCRIPT_CHARS,
+        )
+        text = text[:MAX_TRANSCRIPT_CHARS]
+
+    import time
+    start = time.time()
     summary = _llm_chat(model, template.format(text=text))
+    elapsed = time.time() - start
 
     os.makedirs(summaries_dir, exist_ok=True)
     with open(summary_path, "w", encoding="utf-8") as f:
         f.write(summary)
         f.write("\n")
 
-    print(f"[DONE] Saved: {summary_path}")
-    print(f"\n{summary}\n")
-    print("-" * 60)
+    logger.info(
+        "[SUMMARIZE] Done | file=%s | summary_chars=%d | llm_time=%.0fs",
+        base_name, len(summary), elapsed,
+    )
     return summary_path
 
 
@@ -146,14 +187,12 @@ def summarize_all(downloads_dir: str, summaries_dir: str, model: str, overwrite:
     txt_files = [f for f in txt_files if not f.endswith(".summary.txt")]
 
     if not txt_files:
-        print(f"No .txt files found in '{downloads_dir}'")
+        logger.info("[SUMMARIZE] No .txt files found in '%s'", downloads_dir)
         return
 
     os.makedirs(summaries_dir, exist_ok=True)
 
-    print(f"Found {len(txt_files)} transcript(s). Model: {model}")
-    print(f"Summaries will be saved to: {summaries_dir}\n")
-    print("=" * 60)
+    logger.info("[SUMMARIZE] Found %d transcript(s) | model=%s | output=%s", len(txt_files), model, summaries_dir)
 
     for txt_path in txt_files:
         summarize_file(txt_path, summaries_dir=summaries_dir, model=model, overwrite=overwrite)

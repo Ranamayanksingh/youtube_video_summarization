@@ -1,21 +1,28 @@
 """
-Audio transcription — Groq Whisper API (primary) with mlx-whisper fallback.
+Audio transcription pipeline with four backends (tried in order):
 
-Groq's Whisper API has a 25 MB per-request limit, so large WAV files are split
-into overlapping chunks using ffmpeg before uploading. This avoids the silent
-hang bug in mlx-whisper where inference stalls mid-file on certain audio.
+  1. faster-whisper  — local, CTranslate2 engine, whisper-large-v3-turbo model.
+                       Best quality/stability for local transcription. Never hangs.
+  2. AssemblyAI      — cloud, best multilingual accuracy. Requires ASSEMBLYAI_API_KEY.
+                       Uploads WAV, polls for result (~30–90 s latency).
+  3. Groq            — cloud, whisper-large-v3 via API. Requires GROQ_API_KEY.
+                       25 MB per-request limit; large files are chunked automatically.
+  4. mlx-whisper     — local fallback. May hang on certain audio (known upstream bug).
 
-Groq is used when GROQ_API_KEY is set (checked at runtime via db.get_secret).
-Falls back to local mlx-whisper when Groq is unavailable.
+All backends use task="translate" so both Hindi and English audio produce English transcripts.
 """
 import glob
 import json
+import logging
 import os
 import subprocess
 import tempfile
 import argparse
+import time
 
 import mlx_whisper
+
+logger = logging.getLogger(__name__)
 
 # Explicit paths for ffmpeg/ffprobe — required when running as a launchd
 # service where /opt/homebrew/bin is not on PATH.
@@ -25,7 +32,10 @@ FFPROBE = "/opt/homebrew/bin/ffprobe"
 DEFAULT_WHISPER_MODEL = "mlx-community/whisper-large-v3-mlx"
 DEFAULT_MODEL = DEFAULT_WHISPER_MODEL  # backward compat alias
 
-# Groq Whisper model to use
+# faster-whisper model — large-v3-turbo is same accuracy as large-v3, more stable
+FASTER_WHISPER_MODEL = "large-v3-turbo"
+
+# Groq Whisper model
 GROQ_WHISPER_MODEL = "whisper-large-v3"
 
 # Groq hard limit is 25 MB per request. We target 20 MB chunks to stay safe.
@@ -38,19 +48,21 @@ GROQ_CHUNK_BYTES = GROQ_CHUNK_SIZE_MB * 1024 * 1024
 TRANSCRIBE_TIMEOUT_SECS = 45 * 60
 
 
-# ── Groq helpers ──────────────────────────────────────────────────────────────
+# ── Secret helpers ─────────────────────────────────────────────────────────────
 
-def _get_groq_key() -> str:
-    """Return GROQ_API_KEY from DB secrets or env."""
+def _get_secret(key: str) -> str:
+    """Fetch a secret from DB or env."""
     try:
         from app.db import get_secret
-        key = get_secret("GROQ_API_KEY")
-        if key:
-            return key
+        value = get_secret(key)
+        if value:
+            return value
     except Exception:
         pass
-    return os.environ.get("GROQ_API_KEY", "")
+    return os.environ.get(key, "")
 
+
+# ── ffmpeg/ffprobe helpers ─────────────────────────────────────────────────────
 
 def _wav_duration(wav_path: str) -> float:
     """Return duration in seconds via ffprobe."""
@@ -90,9 +102,146 @@ def _split_wav(wav_path: str, chunk_dir: str, chunk_bytes: int = GROQ_CHUNK_BYTE
         check=True,
     )
     chunks = sorted(glob.glob(os.path.join(chunk_dir, "chunk_*.wav")))
-    print(f"[TRANSCRIBE] Split into {len(chunks)} chunks (chunk_duration={chunk_duration}s)")
+    logger.info("[TRANSCRIBE] Split into %d chunks (chunk_duration=%ds)", len(chunks), chunk_duration)
     return chunks
 
+
+# ── Backend 1: faster-whisper (local, primary) ────────────────────────────────
+
+def _transcribe_with_faster_whisper(wav_path: str, model_size: str = FASTER_WHISPER_MODEL) -> str | None:
+    """
+    Transcribe using faster-whisper (CTranslate2 engine).
+
+    Uses whisper-large-v3-turbo by default — same accuracy as large-v3, more
+    stable, never hangs. Model is downloaded on first use (~1.5 GB) and cached
+    at ~/.cache/huggingface/.
+
+    Always runs with task="translate" so Hindi audio produces English output.
+    """
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError:
+        logger.warning("[FASTER-WHISPER] Not installed — skipping. Run: uv add faster-whisper")
+        return None
+
+    logger.info("[FASTER-WHISPER] Loading model '%s'…", model_size)
+    try:
+        model = WhisperModel(model_size, device="auto", compute_type="default")
+
+        # Get audio duration for progress reporting
+        duration = _wav_duration(wav_path)
+        logger.info(
+            "[FASTER-WHISPER] Starting transcription | file=%s | duration=%.0fs (%.1f min)",
+            os.path.basename(wav_path), duration, duration / 60,
+        )
+
+        segments, info = model.transcribe(
+            wav_path,
+            task="translate",
+            language=None,
+            beam_size=5,
+            vad_filter=True,
+            vad_parameters={"min_silence_duration_ms": 500},
+        )
+
+        logger.info(
+            "[FASTER-WHISPER] Detected language: %s (confidence: %.0f%%)",
+            info.language, info.language_probability * 100,
+        )
+
+        # Consume segments with live progress logging every 30 seconds of audio
+        parts = []
+        last_log_at = 0.0   # audio timestamp of last progress log
+        LOG_EVERY_SECS = 30  # log a progress line every 30s of audio processed
+        start_wall = time.time()
+
+        for segment in segments:
+            parts.append(segment.text.strip())
+            seg_end = segment.end  # position in audio (seconds)
+
+            if seg_end - last_log_at >= LOG_EVERY_SECS:
+                pct = (seg_end / duration * 100) if duration else 0
+                elapsed = time.time() - start_wall
+                logger.info(
+                    "[FASTER-WHISPER] Progress: %.0fs / %.0fs (%.0f%%) — wall time elapsed: %.0fs | last: %r",
+                    seg_end, duration, pct, elapsed, segment.text.strip()[:60],
+                )
+                last_log_at = seg_end
+
+        text = " ".join(parts).strip()
+        if not text:
+            logger.warning("[FASTER-WHISPER] Empty transcript returned for %s", os.path.basename(wav_path))
+            return None
+
+        elapsed_total = time.time() - start_wall
+        logger.info(
+            "[FASTER-WHISPER] Done | chars=%d | wall_time=%.0fs (%.1f min) | file=%s",
+            len(text), elapsed_total, elapsed_total / 60, os.path.basename(wav_path),
+        )
+        return text
+
+    except Exception as e:
+        logger.exception("[FASTER-WHISPER] Failed for %s: %s", os.path.basename(wav_path), e)
+        return None
+
+
+# ── Backend 2: AssemblyAI (cloud, best multilingual accuracy) ─────────────────
+
+def _transcribe_with_assemblyai(wav_path: str) -> str | None:
+    """
+    Transcribe using AssemblyAI's best multilingual model.
+
+    Uploads the WAV file, then polls for the result (~30–90 s).
+    Requires ASSEMBLYAI_API_KEY in .env or app_secrets.
+    Free tier: 100 hours/month at assemblyai.com.
+
+    Always requests English output via speech_model="best" + language_detection.
+    """
+    api_key = _get_secret("ASSEMBLYAI_API_KEY")
+    if not api_key:
+        return None
+
+    try:
+        import assemblyai as aai
+    except ImportError:
+        print("[ASSEMBLYAI] Not installed — skipping. Run: uv add assemblyai")
+        return None
+
+    logger.info("[ASSEMBLYAI] Uploading %s and requesting transcription…", os.path.basename(wav_path))
+    try:
+        aai.settings.api_key = api_key
+
+        config = aai.TranscriptionConfig(
+            speech_model=aai.SpeechModel.best,
+            language_detection=True,
+        )
+
+        transcriber = aai.Transcriber(config=config)
+        start_wall = time.time()
+        transcript = transcriber.transcribe(wav_path)
+
+        if transcript.status == aai.TranscriptStatus.error:
+            logger.error("[ASSEMBLYAI] Transcription failed: %s", transcript.error)
+            return None
+
+        text = (transcript.text or "").strip()
+        if not text:
+            logger.warning("[ASSEMBLYAI] Empty transcript returned for %s", os.path.basename(wav_path))
+            return None
+
+        elapsed = time.time() - start_wall
+        logger.info(
+            "[ASSEMBLYAI] Done | chars=%d | wall_time=%.0fs | file=%s",
+            len(text), elapsed, os.path.basename(wav_path),
+        )
+        return text
+
+    except Exception as e:
+        logger.exception("[ASSEMBLYAI] Failed for %s: %s", os.path.basename(wav_path), e)
+        return None
+
+
+# ── Backend 3: Groq Whisper API (cloud fallback) ──────────────────────────────
 
 def _transcribe_with_groq(wav_path: str) -> str | None:
     """
@@ -102,7 +251,7 @@ def _transcribe_with_groq(wav_path: str) -> str | None:
     """
     from groq import Groq
 
-    api_key = _get_groq_key()
+    api_key = _get_secret("GROQ_API_KEY")
     if not api_key:
         return None
 
@@ -114,7 +263,8 @@ def _transcribe_with_groq(wav_path: str) -> str | None:
 
         for i, chunk_path in enumerate(chunks):
             chunk_size_mb = os.path.getsize(chunk_path) / (1024 * 1024)
-            print(f"[GROQ] Transcribing chunk {i+1}/{len(chunks)} ({chunk_size_mb:.1f} MB)…")
+            logger.info("[GROQ] Chunk %d/%d | size=%.1f MB | sending…", i + 1, len(chunks), chunk_size_mb)
+            chunk_start = time.time()
             try:
                 with open(chunk_path, "rb") as f:
                     response = client.audio.transcriptions.create(
@@ -125,19 +275,26 @@ def _transcribe_with_groq(wav_path: str) -> str | None:
                     )
                 text = response if isinstance(response, str) else response.text
                 parts.append(text.strip())
-                print(f"[GROQ] Chunk {i+1} done: {text[:80].strip()!r}…")
+                logger.info(
+                    "[GROQ] Chunk %d/%d done | %.0fs | preview: %r",
+                    i + 1, len(chunks), time.time() - chunk_start, text.strip()[:60],
+                )
             except Exception as e:
-                print(f"[GROQ] Chunk {i+1} failed: {e}")
+                logger.error("[GROQ] Chunk %d/%d failed: %s", i + 1, len(chunks), e)
                 return None
 
     return "\n".join(parts)
 
 
-# ── mlx-whisper fallback ──────────────────────────────────────────────────────
+# ── Backend 4: mlx-whisper (local, last resort) ───────────────────────────────
 
 def _transcribe_with_mlx(wav_path: str, model_repo: str = DEFAULT_WHISPER_MODEL) -> str | None:
-    """Transcribe using local mlx-whisper. May hang on certain audio."""
-    print(f"[MLX] Transcribing with {model_repo}…")
+    """
+    Transcribe using local mlx-whisper.
+    WARNING: Known to hang mid-file on certain audio. Use only as last resort.
+    """
+    logger.info("[MLX] Starting transcription with %s | file=%s", model_repo, os.path.basename(wav_path))
+    start_wall = time.time()
     try:
         result = mlx_whisper.transcribe(
             wav_path,
@@ -146,9 +303,15 @@ def _transcribe_with_mlx(wav_path: str, model_repo: str = DEFAULT_WHISPER_MODEL)
             language=None,
             verbose=True,
         )
-        return result["text"].strip()
+        text = result["text"].strip()
+        elapsed = time.time() - start_wall
+        logger.info(
+            "[MLX] Done | chars=%d | wall_time=%.0fs (%.1f min) | file=%s",
+            len(text), elapsed, elapsed / 60, os.path.basename(wav_path),
+        )
+        return text
     except Exception as e:
-        print(f"[MLX] Transcription error: {e}")
+        logger.exception("[MLX] Transcription failed for %s: %s", os.path.basename(wav_path), e)
         return None
 
 
@@ -161,51 +324,81 @@ def transcribe_file(
     delete_wav: bool = False,
 ) -> str | None:
     """
-    Transcribes a single WAV file to English. Returns the .txt path, or None on failure.
+    Transcribe a single WAV file to English. Returns the .txt path, or None on failure.
 
-    Strategy:
-      1. If GROQ_API_KEY is set → use Groq Whisper API (chunked, no hang risk).
-      2. Otherwise → fall back to local mlx-whisper.
+    Backend priority:
+      1. faster-whisper  (local, large-v3-turbo — best quality, never hangs)
+      2. AssemblyAI      (cloud, best multilingual — needs ASSEMBLYAI_API_KEY)
+      3. Groq            (cloud, whisper-large-v3  — needs GROQ_API_KEY)
+      4. mlx-whisper     (local fallback           — may hang on some audio)
 
     Args:
-        wav_path: Path to the WAV file.
-        model_repo: HuggingFace repo ID for the mlx-whisper fallback model.
-        overwrite: Re-transcribe even if .txt already exists.
+        wav_path:   Path to the WAV file.
+        model_repo: HuggingFace repo ID for the mlx-whisper last-resort model.
+        overwrite:  Re-transcribe even if .txt already exists.
         delete_wav: Delete the WAV file after successful transcription.
     """
     txt_path = os.path.splitext(wav_path)[0] + ".txt"
 
     if os.path.exists(txt_path) and not overwrite:
-        print(f"[SKIP] Already transcribed: {os.path.basename(wav_path)}")
+        logger.info("[TRANSCRIBE] Already transcribed, skipping: %s", os.path.basename(wav_path))
         return txt_path
 
     wav_size_mb = os.path.getsize(wav_path) / (1024 * 1024) if os.path.exists(wav_path) else 0
-    print(f"[TRANSCRIBING] {os.path.basename(wav_path)} ({wav_size_mb:.0f} MB)")
+    logger.info(
+        "[TRANSCRIBE] Starting | file=%s | size=%.0f MB",
+        os.path.basename(wav_path), wav_size_mb,
+    )
 
-    api_key = _get_groq_key()
-    if api_key:
-        print(f"[TRANSCRIBE] Using Groq Whisper API ({GROQ_WHISPER_MODEL})")
-        text = _transcribe_with_groq(wav_path)
-    else:
-        print("[TRANSCRIBE] No GROQ_API_KEY — falling back to local mlx-whisper")
+    # ── Try each backend in order ──────────────────────────────────────────────
+
+    text: str | None = None
+
+    # 1. faster-whisper (local, always tried first)
+    logger.info("[TRANSCRIBE] Backend 1/4: faster-whisper (local, %s)", FASTER_WHISPER_MODEL)
+    text = _transcribe_with_faster_whisper(wav_path)
+
+    # 2. AssemblyAI (cloud, best multilingual)
+    if not text:
+        assemblyai_key = _get_secret("ASSEMBLYAI_API_KEY")
+        if assemblyai_key:
+            logger.warning("[TRANSCRIBE] faster-whisper failed — Backend 2/4: AssemblyAI (cloud)")
+            text = _transcribe_with_assemblyai(wav_path)
+        else:
+            logger.info("[TRANSCRIBE] No ASSEMBLYAI_API_KEY — skipping Backend 2/4")
+
+    # 3. Groq (cloud whisper API)
+    if not text:
+        groq_key = _get_secret("GROQ_API_KEY")
+        if groq_key:
+            logger.warning("[TRANSCRIBE] AssemblyAI failed/skipped — Backend 3/4: Groq (cloud)")
+            text = _transcribe_with_groq(wav_path)
+        else:
+            logger.info("[TRANSCRIBE] No GROQ_API_KEY — skipping Backend 3/4")
+
+    # 4. mlx-whisper (last resort — may hang)
+    if not text:
+        logger.warning("[TRANSCRIBE] All cloud backends failed — Backend 4/4: mlx-whisper (may hang)")
         text = _transcribe_with_mlx(wav_path, model_repo)
 
+    # ── Write result ───────────────────────────────────────────────────────────
+
     if not text:
-        print(f"❌ Transcription failed: {os.path.basename(wav_path)}")
+        logger.error("[TRANSCRIBE] All backends failed for %s", os.path.basename(wav_path))
         return None
 
     with open(txt_path, "w", encoding="utf-8") as f:
         f.write(text)
         f.write("\n")
-    print(f"[DONE] Saved: {os.path.basename(txt_path)}")
-    print(f"[PREVIEW] {text[:300]}…\n")
+    logger.info("[TRANSCRIBE] Saved transcript: %s | chars=%d", os.path.basename(txt_path), len(text))
+    logger.debug("[TRANSCRIBE] Preview: %s…", text[:200])
 
     if delete_wav:
         try:
             os.remove(wav_path)
-            print(f"[CLEANUP] Deleted WAV: {os.path.basename(wav_path)}")
+            logger.info("[TRANSCRIBE] Deleted WAV after transcription: %s", os.path.basename(wav_path))
         except OSError as e:
-            print(f"[WARN] Could not delete WAV: {e}")
+            logger.warning("[TRANSCRIBE] Could not delete WAV %s: %s", os.path.basename(wav_path), e)
 
     return txt_path
 

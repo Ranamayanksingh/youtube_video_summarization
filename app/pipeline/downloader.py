@@ -4,10 +4,13 @@ Downloads audio from YouTube URLs and converts to WAV.
 Cookies are managed automatically: pulled from Chrome on first run and
 refreshed whenever they expire (every 3 days) — no manual intervention needed.
 """
+import logging
 import os
 import time
 
 import yt_dlp
+
+logger = logging.getLogger(__name__)
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -81,26 +84,26 @@ def _cookies_are_valid(cookies_file: str) -> bool:
 
     if age < COOKIE_REFRESH_INTERVAL:
         age_h = int(age // 3600)
-        print(f"🍪 Reusing cached cookies (age: {age_h}h, refresh in {int((COOKIE_REFRESH_INTERVAL - age) // 3600)}h).")
+        logger.info("[DOWNLOAD] Cookies valid — age: %dh, refresh in %dh", age_h, int((COOKIE_REFRESH_INTERVAL - age) // 3600))
         return True
 
     expiry = _parse_cookie_expiry(cookies_file)
     if expiry == 0:
-        print("🍪 Cookies are over 3 days old. Refreshing from Chrome...")
+        logger.info("[DOWNLOAD] Cookies over 3 days old — refreshing from Chrome…")
         return False
 
     remaining = expiry - int(time.time())
     if remaining <= 0:
-        print("🍪 Cookies have expired. Refreshing from Chrome...")
+        logger.info("[DOWNLOAD] Cookies expired — refreshing from Chrome…")
         return False
 
-    print(f"🍪 Cookies are over 3 days old (cookie expiry in {remaining // 3600}h). Refreshing from Chrome...")
+    logger.info("[DOWNLOAD] Cookie expiry in %dh — refreshing from Chrome…", remaining // 3600)
     return False
 
 
 def _refresh_cookies(cookies_file: str):
     """Export fresh cookies from Chrome into cookies_file using yt-dlp."""
-    print("🍪 Extracting fresh cookies from Chrome...")
+    logger.info("[DOWNLOAD] Extracting fresh cookies from Chrome…")
     os.makedirs(os.path.dirname(cookies_file), exist_ok=True)
     export_opts = {
         'quiet': True,
@@ -110,7 +113,7 @@ def _refresh_cookies(cookies_file: str):
     }
     with yt_dlp.YoutubeDL(export_opts) as ydl:
         ydl.extract_info("https://www.youtube.com", download=False)
-    print("🍪 Cookies refreshed and saved.")
+    logger.info("[DOWNLOAD] Cookies refreshed and saved to %s", COOKIES_FILE)
 
 
 def _ensure_cookies(cookies_file: str):
@@ -121,7 +124,7 @@ def _ensure_cookies(cookies_file: str):
     if _cookies_are_valid(cookies_file):
         return
     if not os.path.exists(cookies_file):
-        print("⚠️  No cookies.txt found. Pulling from Chrome (Keychain popup may appear)...")
+        logger.info("[DOWNLOAD] No cookies.txt found — pulling from Chrome (Keychain popup may appear)…")
     _refresh_cookies(cookies_file)
 
 
@@ -177,7 +180,7 @@ def download_youtube_audio_as_wav(url: str, output_dir: str | None = None) -> st
         ) if os.path.exists(output_dir) else set()
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            print(f"Downloading audio from: {url}")
+            logger.info("[DOWNLOAD] Starting download: %s", url)
             ydl.extract_info(url, download=True)
 
         after = set(f for f in os.listdir(output_dir) if f.endswith(".wav"))
@@ -186,7 +189,7 @@ def download_youtube_audio_as_wav(url: str, output_dir: str | None = None) -> st
         if not new_files:
             wav_files = list(after)
             if not wav_files:
-                print("❌ No WAV file found after download.")
+                logger.error("[DOWNLOAD] No WAV file found after download for: %s", url)
                 return None
             filename = os.path.join(
                 output_dir,
@@ -195,11 +198,11 @@ def download_youtube_audio_as_wav(url: str, output_dir: str | None = None) -> st
         else:
             filename = os.path.join(output_dir, new_files.pop())
 
-        print(f"\n✅ Download complete: {filename}")
+        logger.info("[DOWNLOAD] Complete: %s", filename)
         return filename
 
     except Exception as e:
-        print(f"❌ Error occurred: {e}")
+        logger.exception("[DOWNLOAD] Failed for %s: %s", url, e)
         return None
 
 
